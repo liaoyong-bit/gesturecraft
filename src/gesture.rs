@@ -50,30 +50,69 @@ fn sector_of(dx: f32, dy: f32) -> char {
     }
 }
 
-/// 轨迹 → 方向序列。人手连贯画出的曲线/折线都会被正确拆段。
-pub fn sequence_from_f32(points: &[(f32, f32)], min_seg: f32) -> String {
+/// 方向字符 → 单位向量（屏幕坐标，y 向下）。田字格图示与转折判定共用。
+pub fn axis_of(c: char) -> (f32, f32) {
+    let k = std::f32::consts::FRAC_1_SQRT_2;
+    match c {
+        '8' => (0.0, -1.0),
+        '2' => (0.0, 1.0),
+        '4' => (-1.0, 0.0),
+        '6' => (1.0, 0.0),
+        '7' => (-k, -k),
+        '9' => (k, -k),
+        '1' => (-k, k),
+        '3' => (k, k),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// 轨迹 → 方向序列（带转折滞回）。
+/// 当前方向 c 已定格后，仅当"新方向轴上的投影比当前方向轴上的投影多出 turn_px 以上"
+/// 才认为真的转折、记新段并移动锚点；否则锚点原地不动继续累计，
+/// 让轻微漂移（画 ← 时手向上带一点）始终留在原段里。
+pub fn sequence_from_f32(points: &[(f32, f32)], min_seg: f32, turn_px: f32) -> String {
     let mut seq = String::new();
     if points.len() < 2 {
         return seq;
     }
     let mut anchor = points[0];
+    let mut cur: Option<char> = None;
     for &p in &points[1..] {
         let dx = p.0 - anchor.0;
         let dy = p.1 - anchor.1;
-        if dx.hypot(dy) >= min_seg {
-            let ch = sector_of(dx, dy);
-            if seq.chars().last() != Some(ch) {
+        if dx.hypot(dy) < min_seg {
+            continue;
+        }
+        let ch = sector_of(dx, dy);
+        match cur {
+            None => {
                 seq.push(ch);
+                cur = Some(ch);
+                anchor = p;
             }
-            anchor = p;
+            Some(c) if ch == c => {
+                anchor = p; // 同向继续：锚点跟着走，便于尽快发现下一次转折
+            }
+            Some(c) => {
+                let (cx, cy) = axis_of(c);
+                let (nx, ny) = axis_of(ch);
+                let proj_cur = dx * cx + dy * cy;
+                let proj_new = dx * nx + dy * ny;
+                if proj_new - proj_cur >= turn_px && proj_new >= turn_px {
+                    seq.push(ch);
+                    cur = Some(ch);
+                    anchor = p;
+                }
+                // 未达转折阈值：锚点不动，位移继续累计直到果断转向
+            }
         }
     }
     seq
 }
 
-pub fn sequence_from_i32(points: &[(i32, i32)], min_seg: f32) -> String {
+pub fn sequence_from_i32(points: &[(i32, i32)], min_seg: f32, turn_px: f32) -> String {
     let f: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x as f32, y as f32)).collect();
-    sequence_from_f32(&f, min_seg)
+    sequence_from_f32(&f, min_seg, turn_px)
 }
 
 fn ring_index(c: char) -> Option<usize> {
@@ -142,26 +181,40 @@ mod tests {
     fn straight_down_is_single_dir() {
         // 直线不再产出 "DD"，折叠后只有一个方向
         let pts = vec![(0, 0), (0, 30), (0, 60), (0, 100)];
-        assert_eq!(sequence_from_i32(&pts, 25.0), "2");
+        assert_eq!(sequence_from_i32(&pts, 25.0, 20.0), "2");
     }
 
     #[test]
     fn continuous_stroke_splits_directions() {
         // 连贯一笔：下 → 左 → 右上，不抬手
         let pts = vec![(0, 0), (0, 60), (-60, 60), (0, 20)];
-        assert_eq!(sequence_from_i32(&pts, 25.0), "249");
+        assert_eq!(sequence_from_i32(&pts, 25.0, 20.0), "249");
     }
 
     #[test]
     fn diagonal_is_its_own_dir() {
         let pts = vec![(0, 0), (40, -40)];
-        assert_eq!(sequence_from_i32(&pts, 25.0), "9");
+        assert_eq!(sequence_from_i32(&pts, 25.0, 20.0), "9");
     }
 
     #[test]
     fn jitter_filtered() {
         let pts = vec![(0, 0), (3, 2), (-2, 4), (60, 5)];
-        assert_eq!(sequence_from_i32(&pts, 25.0), "6");
+        assert_eq!(sequence_from_i32(&pts, 25.0, 20.0), "6");
+    }
+
+    #[test]
+    fn drift_does_not_split() {
+        // 画 ← 时手向上带一点漂移：不应多出 ↖ 段（转折阈值的核心场景）
+        let pts = vec![(0, 0), (-30, 0), (-60, -8), (-90, -15), (-120, -18)];
+        assert_eq!(sequence_from_i32(&pts, 25.0, 20.0), "4");
+    }
+
+    #[test]
+    fn decisive_turn_still_splits() {
+        // 果断的 ← 然后 ↖：必须能拆成两段
+        let pts = vec![(0, 0), (-40, 0), (-80, 0), (-100, -40), (-120, -80)];
+        assert_eq!(sequence_from_i32(&pts, 25.0, 20.0), "47");
     }
 
     #[test]

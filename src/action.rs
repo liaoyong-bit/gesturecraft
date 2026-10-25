@@ -397,10 +397,137 @@ fn system_op(op: &str) -> Result<String, String> {
         "show_desktop" => "win+d",
         "task_view" => "win+tab",
         "clipboard_history" => "win+v",
-        "lock" => "win+l",
+        "lock" => return lock_workstation(),
         other => return Err(format!("未知系统操作: {other}")),
     };
     send_combo(combo)
+}
+
+/// 锁屏：直接调用系统 API（模拟 Win+L 会被部分环境拦截）
+#[cfg(windows)]
+fn lock_workstation() -> Result<String, String> {
+    let ok = unsafe { winapi::um::winuser::LockWorkStation() };
+    if ok != 0 {
+        Ok("已锁屏".into())
+    } else {
+        Err("锁屏调用失败".into())
+    }
+}
+#[cfg(not(windows))]
+fn lock_workstation() -> Result<String, String> {
+    Err("仅支持 Windows".into())
+}
+
+/// 常用程序清单（进程关键字, 显示名），供"添加程序"复选列表打底
+pub fn common_programs() -> Vec<(String, String)> {
+    vec![
+        ("msedge".into(), "Microsoft Edge".into()),
+        ("chrome".into(), "Google Chrome".into()),
+        ("firefox".into(), "Firefox".into()),
+        ("explorer".into(), "资源管理器".into()),
+        ("notepad".into(), "记事本".into()),
+        ("weixin".into(), "微信".into()),
+        ("qq".into(), "QQ".into()),
+        ("code".into(), "VS Code".into()),
+        ("cmd".into(), "命令提示符".into()),
+        ("powershell".into(), "PowerShell".into()),
+        ("potplayer".into(), "PotPlayer".into()),
+        ("everything".into(), "Everything".into()),
+        ("winword".into(), "Word".into()),
+        ("excel".into(), "Excel".into()),
+    ]
+}
+
+/// 当前运行中、带可见窗口的程序进程名（小写无 .exe），按窗口数排序去重
+pub fn running_window_processes() -> Vec<String> {
+    #[cfg(windows)]
+    unsafe {
+        use std::collections::BTreeMap;
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winbase::QueryFullProcessImageNameW;
+        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+        use winapi::um::winuser::{
+            EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+        };
+
+        // (pid, 窗口标题非空?) 列表 → 收集后再查进程名（回调里不方便携带复杂状态）
+        let mut windows: Vec<(u32, bool)> = Vec::new();
+        unsafe extern "system" fn cb(hwnd: *mut winapi::shared::windef::HWND__, lparam: isize) -> i32 {
+            let out = &mut *(lparam as *mut Vec<(u32, bool)>);
+            if IsWindowVisible(hwnd) != 0 {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid != 0 {
+                    let mut title = [0u16; 64];
+                    let n = GetWindowTextW(hwnd, title.as_mut_ptr(), 64);
+                    out.push((pid, n > 0));
+                }
+            }
+            1
+        }
+        EnumWindows(Some(cb), &mut windows as *mut _ as isize);
+
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (pid, has_title) in &windows {
+            let name = (|| {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, *pid);
+                if h.is_null() {
+                    return None;
+                }
+                let mut buf = [0u16; 512];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+                CloseHandle(h);
+                if ok == 0 {
+                    return None;
+                }
+                let full = String::from_utf16_lossy(&buf[..len as usize]);
+                full.rsplit(['\\', '/'])
+                    .next()
+                    .map(|s| s.trim_end_matches(".exe").trim_end_matches(".EXE").to_ascii_lowercase())
+            })();
+            if let Some(n) = name {
+                // 有标题的主窗口权重更高
+                let e = counts.entry(n).or_default();
+                *e += if *has_title { 2 } else { 1 };
+            }
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out.into_iter().map(|(n, _)| n).collect()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// 添加程序候选：运行中进程（按窗口数排序）在前，常用清单打底，按进程名去重
+pub fn candidate_programs() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for p in running_window_processes() {
+        let display = common_programs()
+            .iter()
+            .find(|(k, _)| *k == p)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_else(|| {
+                let mut c = p.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => p.clone(),
+                }
+            });
+        seen.push(p.clone());
+        out.push((p, display));
+    }
+    for (k, d) in common_programs() {
+        if !seen.contains(&k) {
+            out.push((k, d));
+        }
+    }
+    out
 }
 
 fn vk_for_char(c: char) -> Option<u16> {

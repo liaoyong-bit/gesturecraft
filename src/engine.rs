@@ -103,10 +103,11 @@ pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>, chord: bool) {
         return;
     }
     let cfg = ctx.config.read().unwrap();
-    let (tolerance, gestures) = (cfg.fuzzy_tolerance, cfg.gestures.clone());
+    let (tolerance, turn_px, gestures) =
+        (cfg.fuzzy_tolerance, cfg.turn_px, cfg.gestures.clone());
     drop(cfg);
 
-    let mut seq = gesture::sequence_from_i32(&pts, SEGMENT_PX);
+    let mut seq = gesture::sequence_from_i32(&pts, SEGMENT_PX, turn_px);
     if chord {
         seq.push('L');
     }

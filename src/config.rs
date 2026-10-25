@@ -1,7 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// 手势分类（标签页筛选用）
+/// 右侧面板的等级页签。等级由 pattern 段数推导（弦式含 'L'）。
+pub const LEVELS: [&str; 4] = ["一级", "二级", "三级", "弦式"];
+
+/// 手势等级归类（面板筛选用）
+pub fn level_of(pattern: &str) -> &'static str {
+    if pattern.contains('L') {
+        return "弦式";
+    }
+    match pattern.chars().count() {
+        1 => "一级",
+        2 => "二级",
+        _ => "三级",
+    }
+}
+
+/// 旧分类（保留用于徽章配色）
 pub const CATEGORIES: [&str; 7] = ["编辑", "导航", "窗口", "浏览器", "系统", "应用", "其他"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +43,7 @@ pub enum ActionDef {
     /// 浏览器：back | forward | refresh | stop | open_link_new_tab | open_link_new_window
     /// | close_tabs_right | close_other_tabs
     Browser { op: String },
-    /// 粘贴并转到：浏览器里定位地址栏→粘贴→回车；其他程序=普通粘贴
+    /// 粘贴并回车：浏览器里定位地址栏→粘贴→回车；其他程序=普通粘贴
     PasteAndGo,
     Script { code: String },
 }
@@ -45,7 +60,7 @@ impl ActionDef {
             ActionDef::Volume { .. } => "音量",
             ActionDef::System { .. } => "系统",
             ActionDef::Browser { .. } => "浏览器",
-            ActionDef::PasteAndGo => "粘贴并转到",
+            ActionDef::PasteAndGo => "粘贴并回车",
             ActionDef::Script { .. } => "脚本",
         }
     }
@@ -58,12 +73,14 @@ impl ActionDef {
             ActionDef::Command { cmd } => cmd.clone(),
             ActionDef::Url { url } => url.clone(),
             ActionDef::SendKeys { keys } => format!("发送 {keys}"),
-            ActionDef::Hotkey { combo } => combo.clone(),
+            ActionDef::Hotkey { combo } => {
+                if combo.is_empty() { "（未绑定）".into() } else { combo.clone() }
+            }
             ActionDef::Window { op } => format!("窗口·{}", window_op_label(op)),
             ActionDef::Volume { op } => format!("音量·{op}"),
             ActionDef::System { op } => format!("系统·{}", system_op_label(op)),
             ActionDef::Browser { op } => format!("浏览器·{}", browser_op_label(op)),
-            ActionDef::PasteAndGo => "定位地址栏粘贴并跳转".into(),
+            ActionDef::PasteAndGo => "浏览器地址栏粘贴回车，其余粘贴".into(),
             ActionDef::Script { code } => code.chars().take(20).collect(),
         }
     }
@@ -76,8 +93,8 @@ pub fn window_op_label(op: &str) -> &str {
         "restore" => "还原",
         "close" => "关闭",
         "topmost" => "置顶切换",
-        "snap_left" => "左半屏",
-        "snap_right" => "右半屏",
+        "snap_left" => "左贴边",
+        "snap_right" => "右贴边",
         other => other,
     }
 }
@@ -114,7 +131,7 @@ pub struct GestureDef {
     pub pattern: String,
     pub enabled: bool,
     pub action: ActionDef,
-    /// 分类标签（编辑/导航/窗口/浏览器/系统/应用/其他）
+    /// 分类标签（徽章配色用）
     #[serde(default)]
     pub category: String,
     /// 作用域：进程名关键字（如 msedge、notepad），空=全局。
@@ -127,20 +144,40 @@ impl GestureDef {
     pub fn is_global(&self) -> bool {
         self.scope.trim().is_empty()
     }
+
+    pub fn level(&self) -> &'static str {
+        level_of(&self.pattern)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub trigger: MouseButton,
     pub threshold_px: f32,
+    /// 转折阈值（滞回）：新方向投影需超出当前方向投影这么多才算真转折。
+    /// 越大越不容易把"左+轻微上漂"拆成两段，越大越难画出多段手势。
+    #[serde(default = "default_turn")]
+    pub turn_px: f32,
     /// 模糊匹配容差：允许与录入序列的最大编辑距离（0=精确）
     #[serde(default = "default_fuzzy")]
     pub fuzzy_tolerance: u32,
+    /// 已添加的程序作用域（进程名关键字列表）
+    #[serde(default = "default_programs")]
+    pub programs: Vec<String>,
     pub gestures: Vec<GestureDef>,
+    /// 配置结构版本；<5 时用新默认表整体替换（v0.4 → v0.5 默认表大改）
+    #[serde(default)]
+    pub schema: u32,
 }
 
 fn default_fuzzy() -> u32 {
     1
+}
+fn default_turn() -> f32 {
+    20.0
+}
+fn default_programs() -> Vec<String> {
+    vec!["msedge".into()]
 }
 
 impl Default for Config {
@@ -148,76 +185,131 @@ impl Default for Config {
         Config {
             trigger: MouseButton::Right,
             threshold_px: 30.0,
+            turn_px: default_turn(),
             fuzzy_tolerance: default_fuzzy(),
-            gestures: Vec::new(),
+            programs: default_programs(),
+            gestures: default_gestures(),
+            schema: 5,
         }
     }
 }
 
-/// 内置手势库。编辑类常用项排最前，Edge 浏览器 16 手势全部收录；
-/// 一键添加，用户可在编辑器里对方向、分类和动作做微调。
-pub fn builtin_presets() -> Vec<GestureDef> {
-    use ActionDef::*;
-    vec![
-        // ---------- 编辑 ----------
-        g("编辑", "复制", "68", Hotkey { combo: "ctrl+c".into() }),
-        g("编辑", "粘贴", "62", Hotkey { combo: "ctrl+v".into() }),
-        g("编辑", "剪切", "86", Hotkey { combo: "ctrl+x".into() }),
-        g("编辑", "撤销", "29", Hotkey { combo: "ctrl+z".into() }),
-        // 弦式：按住右键拖方向后单击左键
-        g("编辑", "粘贴并转到（弦式）", "2L", PasteAndGo),
-        g("编辑", "剪切（弦式）", "8L", Hotkey { combo: "ctrl+x".into() }),
-        // ---------- 导航（Edge 单方向手势） ----------
-        g("导航", "后退", "4", Browser { op: "back".into() }),
-        g("导航", "前进", "6", Browser { op: "forward".into() }),
-        g("导航", "滚动到顶部", "8", Hotkey { combo: "ctrl+home".into() }),
-        g("导航", "滚动到底部", "2", Hotkey { combo: "ctrl+end".into() }),
-        // ---------- 窗口 ----------
-        g("窗口", "最小化前台窗口", "2", Window { op: "minimize".into() }),
-        g("窗口", "最大化前台窗口", "8", Window { op: "maximize".into() }),
-        g("窗口", "关闭前台窗口", "42", Window { op: "close".into() }),
-        g("窗口", "窗口置顶切换", "48", Window { op: "topmost".into() }),
-        g("窗口", "左半屏贴靠", "4", Window { op: "snap_left".into() }),
-        g("窗口", "右半屏贴靠", "6", Window { op: "snap_right".into() }),
-        g("窗口", "切换窗口", "242", Hotkey { combo: "alt+tab".into() }),
-        // ---------- 浏览器（Edge 16 手势完整复刻） ----------
-        g("浏览器", "关闭当前标签页", "23", Hotkey { combo: "ctrl+w".into() }),
-        g("浏览器", "恢复已关闭标签页", "21", Hotkey { combo: "ctrl+shift+t".into() }),
-        g("浏览器", "切换到右侧标签页", "89", Hotkey { combo: "ctrl+tab".into() }),
-        g("浏览器", "切换到左侧标签页", "87", Hotkey { combo: "ctrl+shift+tab".into() }),
-        g("浏览器", "链接在新标签页打开", "69", Browser { op: "open_link_new_tab".into() }),
-        g("浏览器", "链接在新窗口打开", "63", Browser { op: "open_link_new_window".into() }),
-        g("浏览器", "刷新页面", "47", Browser { op: "refresh".into() }),
-        g("浏览器", "停止加载页面", "41", Browser { op: "stop".into() }),
-        g("浏览器", "新建标签页", "28", Hotkey { combo: "ctrl+t".into() }),
-        g("浏览器", "复制当前标签页", "82", Hotkey { combo: "ctrl+shift+k".into() }),
-        g("浏览器", "关闭右侧所有标签页", "64", Browser { op: "close_tabs_right".into() }),
-        g("浏览器", "关闭其他标签页", "46", Browser { op: "close_other_tabs".into() }),
-        g("浏览器", "关闭标签页", "262", Hotkey { combo: "ctrl+w".into() }),
-        g("浏览器", "恢复关闭的标签", "232", Hotkey { combo: "ctrl+shift+t".into() }),
-        g("浏览器", "浏览器刷新", "636", Browser { op: "refresh".into() }),
-        // ---------- 系统 ----------
-        g("系统", "显示桌面", "828", System { op: "show_desktop".into() }),
-        g("系统", "任务视图", "898", System { op: "task_view".into() }),
-        g("系统", "剪贴板历史", "878", System { op: "clipboard_history".into() }),
-        g("系统", "锁屏", "212", System { op: "lock".into() }),
-        g("系统", "音量静音", "121", Volume { op: "mute".into() }),
-        // ---------- 应用 ----------
-        g("应用", "打开资源管理器", "46", RunApp { path: "explorer.exe".into(), args: String::new() }),
-        g("应用", "打开记事本", "63", RunApp { path: "notepad.exe".into(), args: String::new() }),
-        g("应用", "打开百度", "82", Url { url: "https://www.baidu.com".into() }),
-    ]
-}
-
-fn g(category: &str, name: &str, pattern: &str, action: ActionDef) -> GestureDef {
+fn g(category: &str, name: &str, pattern: &str, enabled: bool, action: ActionDef) -> GestureDef {
     GestureDef {
         name: name.into(),
         pattern: pattern.into(),
-        enabled: true,
+        enabled,
         action,
         category: category.into(),
         scope: String::new(),
     }
+}
+
+fn gs(
+    category: &str,
+    name: &str,
+    pattern: &str,
+    enabled: bool,
+    scope: &str,
+    action: ActionDef,
+) -> GestureDef {
+    let mut gd = g(category, name, pattern, enabled, action);
+    gd.scope = scope.into();
+    gd
+}
+
+/// v0.5 默认手势表（用户已确认的分配方案）。
+/// 一级 8（斜向只作单手势）+ 弦式 2 + 二级 12（上下左右两段全用满，镜像成对，
+/// 全部单快捷键零参数）+ 三级 16 启用 + 20 备选（相邻段不重复的 36 种全量）。
+pub fn default_gestures() -> Vec<GestureDef> {
+    use ActionDef::*;
+    let mut v = Vec::new();
+
+    // ---------- 一级：8 个单方向，最常用 ----------
+    v.push(g("编辑", "复制", "8", true, Hotkey { combo: "ctrl+c".into() }));
+    v.push(g("编辑", "粘贴", "2", true, Hotkey { combo: "ctrl+v".into() }));
+    v.push(g("窗口", "窗口左贴边", "4", true, Window { op: "snap_left".into() }));
+    v.push(g("窗口", "窗口右贴边", "6", true, Window { op: "snap_right".into() }));
+    v.push(g("窗口", "最大化", "9", true, Window { op: "maximize".into() }));
+    v.push(g("窗口", "最小化", "1", true, Window { op: "minimize".into() }));
+    v.push(g("编辑", "撤销", "7", true, Hotkey { combo: "ctrl+z".into() }));
+    v.push(g("编辑", "重做", "3", true, Hotkey { combo: "ctrl+y".into() }));
+
+    // ---------- 弦式：方向 + 左键单击 ----------
+    v.push(g("编辑", "剪切（弦式 ↑+左点）", "8L", true, Hotkey { combo: "ctrl+x".into() }));
+    v.push(g("编辑", "粘贴并回车（弦式 ↓+左点）", "2L", true, PasteAndGo));
+
+    // ---------- 二级：上下左右两段 12 种全用满，镜像成对 ----------
+    v.push(g("导航", "切换左侧标签页", "87", true, Hotkey { combo: "ctrl+shift+tab".into() }));
+    v.push(g("导航", "切换右侧标签页", "89", true, Hotkey { combo: "ctrl+tab".into() }));
+    v.push(g("导航", "恢复已关闭标签页", "21", true, Hotkey { combo: "ctrl+shift+t".into() }));
+    v.push(g("导航", "关闭当前标签页", "23", true, Hotkey { combo: "ctrl+w".into() }));
+    v.push(g("导航", "刷新", "47", true, Browser { op: "refresh".into() }));
+    v.push(g("导航", "强制刷新", "69", true, Hotkey { combo: "ctrl+f5".into() }));
+    v.push(g("窗口", "关闭窗口", "43", true, Window { op: "close".into() }));
+    v.push(g("窗口", "新建窗口", "63", true, Hotkey { combo: "ctrl+n".into() }));
+    v.push(g("系统", "任务视图", "46", true, System { op: "task_view".into() }));
+    v.push(g("系统", "显示桌面", "64", true, System { op: "show_desktop".into() }));
+    v.push(g("编辑", "保存", "82", true, Hotkey { combo: "ctrl+s".into() }));
+    v.push(g("编辑", "全选", "28", true, Hotkey { combo: "ctrl+a".into() }));
+
+    // ---------- 三级：36 种中默认绑定 16 条（单快捷键零参数、尽量成对） ----------
+    let three: [(&str, &str, &str, bool, ActionDef); 16] = [
+        ("导航", "新建标签页", "286", true, Hotkey { combo: "ctrl+t".into() }),
+        ("编辑", "查找", "824", true, Hotkey { combo: "ctrl+f".into() }),
+        ("系统", "剪贴板历史", "826", true, System { op: "clipboard_history".into() }),
+        ("系统", "截图", "284", true, Hotkey { combo: "win+shift+s".into() }),
+        ("系统", "任务管理器", "482", true, Hotkey { combo: "ctrl+shift+esc".into() }),
+        ("应用", "资源管理器", "648", true, RunApp { path: "explorer.exe".into(), args: String::new() }),
+        ("系统", "锁屏", "642", true, System { op: "lock".into() }),
+        ("系统", "打开设置", "464", true, Hotkey { combo: "win+i".into() }),
+        ("系统", "上一个虚拟桌面", "242", true, Hotkey { combo: "win+ctrl+left".into() }),
+        ("系统", "下一个虚拟桌面", "262", true, Hotkey { combo: "win+ctrl+right".into() }),
+        ("窗口", "窗口置顶切换", "282", true, Window { op: "topmost".into() }),
+        ("系统", "音量静音", "828", true, Volume { op: "mute".into() }),
+        ("导航", "停止加载", "268", true, Hotkey { combo: "esc".into() }),
+        ("窗口", "最小化所有窗口", "848", true, Hotkey { combo: "win+m".into() }),
+        ("窗口", "还原所有窗口", "868", true, Hotkey { combo: "win+shift+m".into() }),
+        ("导航", "定位地址栏", "628", true, Hotkey { combo: "ctrl+l".into() }),
+    ];
+    for (cat, name, pat, en, act) in three {
+        v.push(g(cat, name, pat, en, act));
+    }
+
+    // ---------- 三级备选 20 条：默认停用，可在面板中自由绑定 ----------
+    // （36 种 = 上下左右三段、相邻段不重复；16 条已绑定，其余为备选）
+    let spare = [
+        "842", "846", "862", "864", "248", "246", "264", "484", "486", "468", "462", "424",
+        "428", "423", "686", "684", "682", "646", "626", "624",
+    ];
+    for pat in spare {
+        v.push(g("其他", &format!("三级备选 {pat}"), pat, false, Hotkey { combo: String::new() }));
+    }
+
+    // ---------- Edge 程序作用域：官方 16 手势完整复刻，默认启用 ----------
+    let edge = [
+        ("后退", "4", Browser { op: "back".into() }),
+        ("前进", "6", Browser { op: "forward".into() }),
+        ("滚动到页面顶部", "8", Hotkey { combo: "ctrl+home".into() }),
+        ("滚动到页面底部", "2", Hotkey { combo: "ctrl+end".into() }),
+        ("关闭当前标签页", "23", Hotkey { combo: "ctrl+w".into() }),
+        ("恢复已关闭标签页", "21", Hotkey { combo: "ctrl+shift+t".into() }),
+        ("切换到右侧标签页", "89", Hotkey { combo: "ctrl+tab".into() }),
+        ("切换到左侧标签页", "87", Hotkey { combo: "ctrl+shift+tab".into() }),
+        ("链接在新标签页打开", "69", Browser { op: "open_link_new_tab".into() }),
+        ("链接在新窗口打开", "63", Browser { op: "open_link_new_window".into() }),
+        ("刷新页面", "47", Browser { op: "refresh".into() }),
+        ("停止加载页面", "41", Browser { op: "stop".into() }),
+        ("新建标签页", "28", Hotkey { combo: "ctrl+t".into() }),
+        ("复制当前标签页", "82", Hotkey { combo: "ctrl+shift+k".into() }),
+        ("关闭右侧所有标签页", "64", Browser { op: "close_tabs_right".into() }),
+        ("关闭其他标签页", "46", Browser { op: "close_other_tabs".into() }),
+    ];
+    for (name, pat, act) in edge {
+        v.push(gs("浏览器", &format!("Edge·{name}"), pat, true, "msedge", act));
+    }
+
+    v
 }
 
 /// 旧版 UDLR 序列 → 8 方向数字编码，并折叠相邻重复（旧版 "DD" 不可达，归一为 "2"）。
@@ -245,6 +337,61 @@ fn migrate_pattern(p: &str) -> String {
 }
 
 impl Config {
+    /// 保存前的重复检测——查的就是 config.json 这份"小库"，实时反映当前全部手势。
+    /// 允许重复，只产生提示文案；exclude = 编辑已有手势时跳过它自己。
+    pub fn conflict_warnings(&self, cand: &GestureDef, exclude: Option<usize>) -> Vec<String> {
+        let mut out = Vec::new();
+        if cand.pattern.is_empty() {
+            return out;
+        }
+        let cand_scopes: Vec<String> = cand
+            .scope
+            .to_ascii_lowercase()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for (i, g) in self.gestures.iter().enumerate() {
+            if Some(i) == exclude || !g.enabled || g.pattern.is_empty() {
+                continue;
+            }
+            // 作用域是否重叠：任一方为全局即覆盖面重叠；否则看进程关键字交集
+            let other_scopes: Vec<String> = g
+                .scope
+                .to_ascii_lowercase()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let overlap = cand_scopes.is_empty()
+                || other_scopes.is_empty()
+                || cand_scopes.iter().any(|a| other_scopes.contains(a));
+            if !overlap {
+                continue;
+            }
+            if g.pattern == cand.pattern {
+                let scope_desc = if other_scopes.is_empty() { "全局" } else { "程序作用域" };
+                out.push(format!(
+                    "方向序列 {} 已被「{}」（{scope_desc}）占用",
+                    crate::gesture::arrows(&cand.pattern),
+                    g.name
+                ));
+            }
+            if g.action == cand.action {
+                out.push(format!(
+                    "动作「{}」与「{}」重复绑定",
+                    cand.action.summary(),
+                    g.name
+                ));
+            }
+            if g.name.trim() == cand.name.trim() {
+                out.push(format!("名称「{}」已存在", cand.name.trim()));
+            }
+        }
+        out.dedup();
+        out
+    }
+
     fn path() -> PathBuf {
         let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
         PathBuf::from(base).join("GestureCraft").join("config.json")
@@ -257,6 +404,17 @@ impl Config {
                 Ok(mut c) => {
                     for gd in &mut c.gestures {
                         gd.pattern = migrate_pattern(&gd.pattern);
+                    }
+                    // v0.4 及更早配置（schema<5）：默认表整体换代，保留触发设置
+                    if c.schema < 5 {
+                        let (trigger, th, fuzzy) = (c.trigger, c.threshold_px, c.fuzzy_tolerance);
+                        c = Config {
+                            trigger,
+                            threshold_px: th,
+                            fuzzy_tolerance: fuzzy,
+                            ..Config::default()
+                        };
+                        let _ = c.save();
                     }
                     c
                 }
