@@ -5,7 +5,7 @@
 use crate::config::MouseButton;
 use crate::engine::{self, Ctx};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 struct HookState {
     start: Mutex<Option<(i32, i32)>>,
@@ -48,7 +48,7 @@ unsafe fn run_hook(ctx: Ctx) {
     UnhookWindowsHookEx(hook);
 }
 
-unsafe fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
+unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use winapi::um::winuser::{
         CallNextHookEx, MSLLHOOKSTRUCT, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
         WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -108,10 +108,11 @@ unsafe fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
             let had_start = state.start.lock().unwrap().take().is_some();
             if was_gesturing {
                 let pts = state.points.lock().unwrap().clone();
-                let ctx2 = ctx as *const Ctx;
-                let pts2 = pts;
                 std::thread::spawn(move || {
-                    engine::handle_path(&*ctx2, pts2);
+                    // 从静态 CTX 取引用，避免跨线程传递裸指针
+                    if let Some(c) = CTX.get() {
+                        engine::handle_path(c, pts);
+                    }
                 });
                 return 1; // 吞掉抬起，防止弹菜单
             }

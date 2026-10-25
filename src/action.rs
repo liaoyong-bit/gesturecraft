@@ -129,21 +129,19 @@ fn vk_special(name: &str) -> Option<u16> {
 
 #[cfg(windows)]
 fn key_event(vk: u16, up: bool) -> winapi::um::winuser::INPUT {
-    use winapi::um::winuser::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    };
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        u: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                wScan: 0,
-                dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
+    use winapi::um::winuser::{INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP};
+    let mut input: INPUT = unsafe { std::mem::zeroed() };
+    input.type_ = INPUT_KEYBOARD;
+    unsafe {
+        *input.u.ki_mut() = KEYBDINPUT {
+            wVk: vk,
+            wScan: 0,
+            dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+            time: 0,
+            dwExtraInfo: 0,
+        };
     }
+    input
 }
 
 #[cfg(windows)]
@@ -178,10 +176,10 @@ fn send_keys(spec: &str) -> Result<String, String> {
         } else if let Some(vk) = vk_for_char(c) {
             let need_shift = c.is_ascii_uppercase() || "\\~!@#$%^&*()_+|{}:\"<>?".contains(c);
             if need_shift {
-                events.push(key_event(VK_SHIFT, false));
+                events.push(key_event(VK_SHIFT as u16, false));
                 events.push(key_event(vk, false));
                 events.push(key_event(vk, true));
-                events.push(key_event(VK_SHIFT, true));
+                events.push(key_event(VK_SHIFT as u16, true));
             } else {
                 events.push(key_event(vk, false));
                 events.push(key_event(vk, true));
@@ -193,7 +191,7 @@ fn send_keys(spec: &str) -> Result<String, String> {
     if events.is_empty() {
         return Ok("空按键序列".into());
     }
-    let sent = unsafe { SendInput(events.len() as c_int, events.as_ptr(), std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int) };
+    let sent = unsafe { SendInput(events.len() as u32, events.as_mut_ptr(), std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int) };
     if sent == events.len() as u32 {
         Ok(format!("发送 {} 个按键事件", sent))
     } else {

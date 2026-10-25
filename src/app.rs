@@ -90,11 +90,6 @@ fn default_draft() -> GestureDef {
 }
 
 impl eframe::App for UiApp {
-    fn on_close_event(&mut self) -> bool {
-        let _ = self.config.read().unwrap().save();
-        true
-    }
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::SidePanel::left("nav").show(ctx, |ui| {
             ui.add_space(8.0);
@@ -225,6 +220,7 @@ impl UiApp {
             ui.end_row();
 
             ui.label("动作参数");
+            let is_cmd = matches!(self.draft.action, ActionDef::Command { .. });
             match &mut self.draft.action {
                 ActionDef::RunApp { path, args } => {
                     ui.vertical(|ui| {
@@ -236,7 +232,7 @@ impl UiApp {
                 | ActionDef::Url { url: cmd } => {
                     ui.add(
                         egui::TextEdit::singleline(cmd)
-                            .hint_text(if matches!(self.draft.action, ActionDef::Command { .. }) { "命令行" } else { "https://..." }),
+                            .hint_text(if is_cmd { "命令行" } else { "https://..." }),
                     );
                 }
                 ActionDef::SendKeys { keys } => {
