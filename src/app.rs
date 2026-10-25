@@ -91,6 +91,8 @@ pub struct UiApp {
     edit_index: Option<usize>,
     /// 新建态显式标志（修复"新建按钮点了没反应"）
     creating: bool,
+    /// 方向序列锁定：从格子进入编辑器后手势已定，不允许再改（只能改名称/动作）
+    pattern_locked: bool,
     draft: GestureDef,
     pad_points: Vec<egui::Vec2>,
     /// 测试框状态：最近一次拖动的轨迹与匹配结果
@@ -135,6 +137,7 @@ pub fn run_ui(
                 sel: None,
                 edit_index: None,
                 creating: false,
+                pattern_locked: false,
                 draft,
                 pad_points: Vec::new(),
                 test_points: Vec::new(),
@@ -403,7 +406,7 @@ impl UiApp {
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("v0.5.4").small().color(NAV_TEXT_DIM));
+                    ui.label(egui::RichText::new("v0.5.5").small().color(NAV_TEXT_DIM));
                     ui.add_space(8.0);
                     let paused = self.paused.load(Ordering::Relaxed);
                     let label = if paused { "▶  恢复监听" } else { "⏸  暂停监听" };
@@ -442,7 +445,7 @@ impl UiApp {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("全局手势").strong().size(22.0).color(INK));
                 ui.label(
-                    egui::RichText::new("所有程序通用；按一级 / 二级 / 三级分面板，弦式并入一级，可自由改绑动作")
+                    egui::RichText::new("所有程序通用；二级/三级只用上下左右（不用斜向，防误判），弦式并入一级")
                         .small()
                         .color(MUTED),
                 );
@@ -458,6 +461,7 @@ impl UiApp {
                 if ui.add(primary_button("＋ 新建手势")).clicked() {
                     self.edit_index = None;
                     self.creating = true;
+                    self.pattern_locked = false; // 空白新建：手势可自由画
                     self.draft = default_draft();
                     self.pad_points.clear();
                 }
@@ -532,7 +536,7 @@ impl UiApp {
         );
         ui.add_space(6.0);
 
-        let (cell_w, cell_h) = if level == "一级" { (175.0, 56.0) } else { (150.0, 46.0) };
+        let (cell_w, cell_h) = if level == "一级" { (175.0, 56.0) } else { (122.0, 40.0) };
         const MAIN: [char; 4] = ['8', '2', '4', '6'];
 
         if level == "一级" {
@@ -564,7 +568,8 @@ impl UiApp {
                 .collect();
             self.direction_grid(ui, "", &chords, cell_w, cell_h, false, "L");
         } else {
-            // 二级 / 三级：只使用上下左右；按起笔分组，全部组合都摆出来便于绑定
+            // 二级 / 三级：每段只用上下左右；按起笔分组，固定每行两张田字格，
+            // 避免横向溢出（此前 horizontal_wrapped 会被窗口裁掉一列）
             let prefixes: Vec<String> = if level == "二级" {
                 MAIN.iter().map(|c| c.to_string()).collect()
             } else {
@@ -578,23 +583,27 @@ impl UiApp {
                 }
                 ps
             };
-            ui.horizontal_wrapped(|ui| {
-                for prefix in &prefixes {
-                    ui.vertical(|ui| {
-                        ui.set_min_width(cell_w * 3.0 + 28.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "起笔 {}",
-                                crate::gesture::arrows(prefix)
-                            ))
-                            .strong()
-                            .size(13.5)
-                            .color(INK),
-                        );
-                        self.direction_grid(ui, prefix, all, cell_w, cell_h, true, "");
-                    });
-                }
-            });
+            for chunk in prefixes.chunks(2) {
+                ui.horizontal(|ui| {
+                    for prefix in chunk {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(cell_w * 3.0 + 24.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "起笔 {}",
+                                    crate::gesture::arrows(prefix)
+                                ))
+                                .strong()
+                                .size(13.0)
+                                .color(INK),
+                            );
+                            self.direction_grid(ui, prefix, all, cell_w, cell_h, true, "");
+                        });
+                        ui.add_space(14.0);
+                    }
+                });
+                ui.add_space(4.0);
+            }
         }
 
         ui.add_space(10.0);
@@ -664,6 +673,11 @@ impl UiApp {
                         }
                         continue;
                     };
+                    // 同向段画不出来（同向拖动会并成一段），隐藏该格，不留"新建"入口
+                    if prefix.chars().last() == Some(dir) {
+                        ui.label("");
+                        continue;
+                    }
                     let cand = format!("{prefix}{dir}{suffix}");
                     // 显示用箭头串：弦式末段显示圆点
                     let arrow = if suffix == "L" {
@@ -762,6 +776,7 @@ impl UiApp {
                     if ui.small_button("编辑").clicked() {
                         self.edit_index = Some(idx);
                         self.creating = false;
+                        self.pattern_locked = true; // 已有手势：方向序列固定
                         self.draft = self.config.read().unwrap().gestures[idx].clone();
                         self.pad_points.clear();
                     }
@@ -787,6 +802,7 @@ impl UiApp {
                         self.draft = d;
                         self.edit_index = None;
                         self.creating = true;
+                        self.pattern_locked = true; // 手势已由格子定死
                         self.pad_points.clear();
                     }
                 }
@@ -808,6 +824,7 @@ impl UiApp {
             // 右上角 × 关闭 = 取消
             self.edit_index = None;
             self.creating = false;
+            self.pattern_locked = false;
             self.draft = default_draft();
             self.pad_points.clear();
         }
@@ -962,87 +979,107 @@ impl UiApp {
                 });
 
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("方向序列（点九宫格快录，或在下方手绘板拖画；弦式可追加左键单击）")
-                    .color(INK),
-            );
-            ui.horizontal(|ui| {
-                egui::Grid::new("dirpad")
-                    .num_columns(3)
-                    .spacing([6.0, 6.0])
-                    .show(ui, |ui| {
-                        for row in [["7", "8", "9"], ["4", "", "6"], ["1", "2", "3"]] {
-                            for cell in row {
-                                if cell.is_empty() {
-                                    ui.label("");
-                                } else if ui
-                                    .button(egui::RichText::new(
-                                        gesture::arrow_for(cell.chars().next().unwrap()),
-                                    )
-                                    .size(18.0))
-                                    .clicked()
-                                {
-                                    self.draft.pattern.push_str(cell);
-                                }
-                            }
-                            ui.end_row();
-                        }
-                    });
-                ui.vertical(|ui| {
+            if self.pattern_locked {
+                // 手势已定（从田字格进入）：只展示，不可修改
+                ui.label(
+                    egui::RichText::new("方向序列（已锁定，不可修改）").color(INK),
+                );
+                ui.horizontal(|ui| {
                     draw_tian(ui, 76.0, &self.draft.pattern);
-                    ui.horizontal(|ui| {
-                        if ui.small_button("⌫ 退格").clicked() {
-                            self.draft.pattern.pop();
-                        }
-                        if ui.small_button("清空").clicked() {
-                            self.draft.pattern.clear();
-                            self.pad_points.clear();
-                        }
-                        if ui.small_button("＋ 左键单击").clicked() {
-                            self.draft.pattern.push('L');
-                        }
-                    });
                     ui.label(
-                        egui::RichText::new("弦式：按住触发键拖出方向后单击左键\n含左键单击的手势只做精确匹配")
-                            .small()
-                            .color(MUTED),
+                        egui::RichText::new(crate::gesture::arrows(&self.draft.pattern))
+                            .strong()
+                            .size(18.0)
+                            .color(ACCENT),
                     );
                 });
-            });
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "方向序列（点九宫格快录，或在下方手绘板拖画；弦式可追加左键单击）",
+                    )
+                    .color(INK),
+                );
+                ui.horizontal(|ui| {
+                    egui::Grid::new("dirpad")
+                        .num_columns(3)
+                        .spacing([6.0, 6.0])
+                        .show(ui, |ui| {
+                            for row in [["7", "8", "9"], ["4", "", "6"], ["1", "2", "3"]] {
+                                for cell in row {
+                                    if cell.is_empty() {
+                                        ui.label("");
+                                    } else if ui
+                                        .button(egui::RichText::new(
+                                            gesture::arrow_for(cell.chars().next().unwrap()),
+                                        )
+                                        .size(18.0))
+                                        .clicked()
+                                    {
+                                        self.draft.pattern.push_str(cell);
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    ui.vertical(|ui| {
+                        draw_tian(ui, 76.0, &self.draft.pattern);
+                        ui.horizontal(|ui| {
+                            if ui.small_button("⌫ 退格").clicked() {
+                                self.draft.pattern.pop();
+                            }
+                            if ui.small_button("清空").clicked() {
+                                self.draft.pattern.clear();
+                                self.pad_points.clear();
+                            }
+                            if ui.small_button("＋ 左键单击").clicked() {
+                                self.draft.pattern.push('L');
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "弦式：按住触发键拖出方向后单击左键\n含左键单击的手势只做精确匹配",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
+                });
 
-            // 手绘板
-            let (rect, resp) = ui
-                .allocate_exact_size(egui::vec2(360.0, 150.0), egui::Sense::click_and_drag());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(246, 248, 252));
-            painter.rect_stroke(
-                rect,
-                8.0,
-                (
-                    1.5,
-                    if resp.dragged() {
-                        ACCENT
-                    } else {
-                        egui::Color32::from_rgb(210, 216, 228)
-                    },
-                ),
-            );
-            if resp.dragged() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    self.pad_points.push(p - rect.min);
+                // 手绘板
+                let (rect, resp) = ui
+                    .allocate_exact_size(egui::vec2(360.0, 150.0), egui::Sense::click_and_drag());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(246, 248, 252));
+                painter.rect_stroke(
+                    rect,
+                    8.0,
+                    (
+                        1.5,
+                        if resp.dragged() {
+                            ACCENT
+                        } else {
+                            egui::Color32::from_rgb(210, 216, 228)
+                        },
+                    ),
+                );
+                if resp.dragged() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        self.pad_points.push(p - rect.min);
+                    }
                 }
-            }
-            if resp.drag_stopped() {
-                let pts: Vec<(f32, f32)> = self.pad_points.iter().map(|v| (v.x, v.y)).collect();
-                let turn = self.config.read().unwrap().turn_px;
-                self.draft.pattern = gesture::sequence_from_f32(&pts, 25.0, turn);
-            }
-            if !self.pad_points.is_empty() {
-                let stroke = egui::Stroke::new(3.0_f32, ACCENT);
-                painter.add(egui::Shape::line(
-                    self.pad_points.iter().map(|p| rect.min + *p).collect(),
-                    stroke,
-                ));
+                if resp.drag_stopped() {
+                    let pts: Vec<(f32, f32)> = self.pad_points.iter().map(|v| (v.x, v.y)).collect();
+                    let turn = self.config.read().unwrap().turn_px;
+                    self.draft.pattern = gesture::sequence_from_f32(&pts, 25.0, turn);
+                }
+                if !self.pad_points.is_empty() {
+                    let stroke = egui::Stroke::new(3.0_f32, ACCENT);
+                    painter.add(egui::Shape::line(
+                        self.pad_points.iter().map(|p| rect.min + *p).collect(),
+                        stroke,
+                    ));
+                }
             }
 
             ui.add_space(6.0);
@@ -1088,6 +1125,7 @@ impl UiApp {
                 {
                     self.edit_index = None;
                     self.creating = false;
+                    self.pattern_locked = false;
                     self.draft = default_draft();
                     self.pad_points.clear();
                 }
@@ -1106,6 +1144,7 @@ impl UiApp {
         drop(cfg);
         self.edit_index = None;
         self.creating = false;
+        self.pattern_locked = false;
         self.draft = default_draft();
         self.pad_points.clear();
         self.status = "已保存".into();
@@ -1284,7 +1323,7 @@ impl UiApp {
         ui.add_space(4.0);
         card(ui, |ui| {
             ui.label(
-                egui::RichText::new("GestureCraft v0.5.4").strong().size(20.0).color(ACCENT),
+                egui::RichText::new("GestureCraft v0.5.5").strong().size(20.0).color(ACCENT),
             );
             ui.label(egui::RichText::new("原创 Rust 实现的 Windows 全局鼠标手势工具。").color(INK));
             ui.add_space(6.0);
@@ -1292,8 +1331,8 @@ impl UiApp {
                 "· 一级 8 单手势 + 弦式 8（方向+左点，末段圆点），斜向只作单手势",
                 "· 二级 12 种、三级 36 种只使用上下左右，按起笔分田字格展示",
                 "· 田字格点选式面板：格子即手势，点选后底部编辑/删除/启停",
-                "· 二级 12 种两段联动全用满（镜像成对，全部单快捷键零参数）",
-                "· 三级 36 种三段联动全量列出，默认绑 16 条、备选 20 条，可自由改绑",
+                "· 二级 12 种两段联动全用满（只用上下左右，镜像成对，单快捷键零参数）",
+                "· 三级 36 种三段联动全量列出（同样只用上下左右），默认绑 16 条",
                 "· 互切合并：最大化⇄还原、左/右贴边⇄还原、置顶、静音、显示桌面都是同一手势来回切",
                 "· 全部手势全局生效；重复的手势/名称不允许保存，编辑器直接报错",
                 "· 田字格图示：米字格中心起笔连贯一笔，转折阈值防微漂误拆",

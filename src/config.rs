@@ -168,7 +168,7 @@ pub struct Config {
     #[serde(default)]
     pub target_mode: TargetMode,
     pub gestures: Vec<GestureDef>,
-    /// 配置结构版本；<6 时手势表整体换代（v0.5.3 起取消程序作用域，全部全局）
+    /// 配置结构版本；<7 时手势表整体换代（v0.5.5 起二级/三级只用上下左右）
     #[serde(default)]
     pub schema: u32,
 }
@@ -189,7 +189,7 @@ impl Default for Config {
             fuzzy_tolerance: default_fuzzy(),
             target_mode: TargetMode::Focused,
             gestures: default_gestures(),
-            schema: 6,
+            schema: 7,
         }
     }
 }
@@ -204,9 +204,12 @@ fn g(category: &str, name: &str, pattern: &str, enabled: bool, action: ActionDef
     }
 }
 
-/// v0.5 默认手势表（用户已确认的分配方案）。
-/// 一级 8 单手势 + 弦式 8（并入一级，方向+左点）+ 二级 12（上下左右两段全用满，
-/// 镜像成对，全部单快捷键零参数）+ 三级 16 启用 + 20 备选（上下左右三段 36 种全量）。
+/// v0.5.5 默认手势表。
+/// 一级 8 单手势（斜向只作单手势）+ 弦式 8（并入一级，方向+左点）+
+/// 二级 12（上下左右两段全部用满，镜像成对，单快捷键零参数）+
+/// 三级 16 启用 + 20 备选（上下左右三段 36 种全量）。
+/// 二级/三级的每一段都只用上下左右——斜向不出现在组合里，避免 ←+↑ 与 ←+↖
+/// 这类 45° 边界难以区分的误判。
 pub fn default_gestures() -> Vec<GestureDef> {
     use ActionDef::*;
     let mut v = Vec::new();
@@ -231,19 +234,19 @@ pub fn default_gestures() -> Vec<GestureDef> {
     v.push(g("导航", "重置缩放", "7L", true, Hotkey { combo: "ctrl+0".into() }));
     v.push(g("导航", "全屏切换", "3L", true, Hotkey { combo: "f11".into() }));
 
-    // ---------- 二级：上下左右两段 12 种全用满，镜像成对 ----------
-    v.push(g("导航", "切换左侧标签页", "87", true, Hotkey { combo: "ctrl+shift+tab".into() }));
-    v.push(g("导航", "切换右侧标签页", "89", true, Hotkey { combo: "ctrl+tab".into() }));
-    v.push(g("导航", "恢复已关闭标签页", "21", true, Hotkey { combo: "ctrl+shift+t".into() }));
-    v.push(g("导航", "关闭当前标签页", "23", true, Hotkey { combo: "ctrl+w".into() }));
-    v.push(g("导航", "刷新", "47", true, Browser { op: "refresh".into() }));
-    v.push(g("导航", "强制刷新", "69", true, Hotkey { combo: "ctrl+f5".into() }));
-    v.push(g("窗口", "关闭窗口", "43", true, Window { op: "close".into() }));
-    v.push(g("窗口", "新建窗口", "63", true, Hotkey { combo: "ctrl+n".into() }));
-    v.push(g("系统", "任务视图", "46", true, System { op: "task_view".into() }));
-    v.push(g("系统", "显示桌面", "64", true, System { op: "show_desktop".into() }));
+    // ---------- 二级：上下左右两段 12 种全用满（每段都不用斜向），镜像成对 ----------
     v.push(g("编辑", "保存", "82", true, Hotkey { combo: "ctrl+s".into() }));
     v.push(g("编辑", "全选", "28", true, Hotkey { combo: "ctrl+a".into() }));
+    v.push(g("导航", "切换左侧标签页", "84", true, Hotkey { combo: "ctrl+shift+tab".into() }));
+    v.push(g("导航", "切换右侧标签页", "86", true, Hotkey { combo: "ctrl+tab".into() }));
+    v.push(g("导航", "恢复已关闭标签页", "24", true, Hotkey { combo: "ctrl+shift+t".into() }));
+    v.push(g("导航", "关闭当前标签页", "26", true, Hotkey { combo: "ctrl+w".into() }));
+    v.push(g("导航", "刷新", "48", true, Browser { op: "refresh".into() }));
+    v.push(g("导航", "强制刷新", "68", true, Hotkey { combo: "ctrl+f5".into() }));
+    v.push(g("窗口", "关闭窗口", "42", true, Window { op: "close".into() }));
+    v.push(g("窗口", "新建窗口", "62", true, Hotkey { combo: "ctrl+n".into() }));
+    v.push(g("系统", "任务视图", "46", true, System { op: "task_view".into() }));
+    v.push(g("系统", "显示桌面", "64", true, System { op: "show_desktop".into() }));
 
     // ---------- 三级：36 种中默认绑定 16 条（单快捷键零参数、尽量成对） ----------
     let three: [(&str, &str, &str, bool, ActionDef); 16] = [
@@ -272,7 +275,7 @@ pub fn default_gestures() -> Vec<GestureDef> {
     // （36 种 = 上下左右三段、相邻段不重复；16 条已绑定，其余为备选）
     let spare = [
         "842", "846", "862", "864", "248", "246", "264", "484", "486", "468", "462", "424",
-        "428", "423", "686", "684", "682", "646", "626", "624",
+        "428", "426", "686", "684", "682", "646", "626", "624",
     ];
     for pat in spare {
         v.push(g("其他", &format!("三级备选 {pat}"), pat, false, Hotkey { combo: String::new() }));
@@ -343,8 +346,8 @@ impl Config {
                     for gd in &mut c.gestures {
                         gd.pattern = migrate_pattern(&gd.pattern);
                     }
-                    // 旧配置（schema<6，含程序作用域/程序预设）：手势表整体换代，保留触发设置
-                    if c.schema < 6 {
+                    // 旧配置（schema<7，二级含斜向段/程序作用域等旧表）：手势表整体换代，保留触发设置
+                    if c.schema < 7 {
                         let (trigger, th, turn, fuzzy, tm) = (
                             c.trigger,
                             c.threshold_px,
