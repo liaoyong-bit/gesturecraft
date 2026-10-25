@@ -18,6 +18,7 @@ fn main() {
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let paused = Arc::new(AtomicBool::new(false));
     let ui_ctx: Arc<std::sync::OnceLock<eframe::egui::Context>> = Arc::new(Default::default());
+    let toast: Arc<Mutex<Option<(String, std::time::Instant)>>> = Arc::new(Mutex::new(None));
 
     #[cfg(windows)]
     hook::start_hook_thread(engine::Ctx {
@@ -25,7 +26,8 @@ fn main() {
         logs: logs.clone(),
         paused: paused.clone(),
         ui_ctx: ui_ctx.clone(),
+        toast: toast.clone(),
     });
 
-    app::run_ui(config, logs, paused, ui_ctx);
+    app::run_ui(config, logs, paused, ui_ctx, toast);
 }

@@ -2,6 +2,9 @@
 /// 8=↑ 2=↓ 4=← 6=→ 7=↖ 9=↗ 1=↙ 3=↘
 /// 连贯拆分：锚点分段——轨迹每累计 min_seg 净位移就判一次主导方向（45° 扇区），
 /// 方向变了即记新符号，无需抬手。组合空间：1 段 8 种、2 段 64 种、3 段 512 种。
+///
+/// 弦式手势（chord）：'L' 表示"按住触发键期间单击左键"，
+/// 模式如 "2L" = 向下拖 + 左键单击。含 'L' 的模式只做精确匹配，避免误触。
 
 /// 顺时针方位环：→ ↘ ↓ ↙ ← ↖ ↑ ↗（模糊匹配的角度距离按环上档位计）
 const RING: [char; 8] = ['6', '3', '2', '1', '4', '7', '8', '9'];
@@ -16,12 +19,17 @@ pub fn arrow_for(c: char) -> &'static str {
         '9' => "↗",
         '1' => "↙",
         '3' => "↘",
+        'L' => "左点",
         _ => "?",
     }
 }
 
 pub fn arrows(pattern: &str) -> String {
     pattern.chars().map(arrow_for).collect()
+}
+
+pub fn is_chord(pattern: &str) -> bool {
+    pattern.contains('L')
 }
 
 /// 屏幕坐标（y 向下）。角度以正右方为 0、顺时针为正，45° 一扇区。
@@ -72,8 +80,12 @@ fn ring_index(c: char) -> Option<usize> {
     RING.iter().position(|&r| r == c)
 }
 
-/// 两方向在方位环上的档位距离：相邻 45° = 1，相对 180° = 4
+/// 两方向在方位环上的档位距离：相邻 45° = 1，相对 180° = 4。
+/// 'L'（左键单击段）与任何方向都视为 4（实质不可替换），与自身为 0。
 fn dir_dist(a: char, b: char) -> usize {
+    if a == 'L' || b == 'L' {
+        return if a == b { 0 } else { 4 };
+    }
     match (ring_index(a), ring_index(b)) {
         (Some(ia), Some(ib)) => {
             let d = ia.abs_diff(ib);
@@ -110,7 +122,11 @@ pub fn fuzzy_distance(seq: &str, pattern: &str) -> usize {
 }
 
 /// 有效容差 = min(用户容差, pattern 长度/2)；长度 1 的手势只精确匹配，避免误触。
+/// 弦式手势（含 'L'）一律只精确匹配：左键单击被吞掉代价高，宁缺勿滥。
 pub fn tolerance_for(pattern: &str, user_tolerance: u32) -> u32 {
+    if is_chord(pattern) {
+        return 0;
+    }
     let len = pattern.chars().count() as u32;
     if len == 0 {
         return 0;
@@ -160,8 +176,22 @@ mod tests {
     }
 
     #[test]
+    fn chord_matching() {
+        // 弦式：方向段 + 左键单击
+        assert_eq!(fuzzy_distance("2L", "2L"), 0);
+        assert_eq!(fuzzy_distance("2L", "2"), 1); // 少了左键单击
+        assert_eq!(fuzzy_distance("2", "2L"), 1);
+        // 方向与 L 不可互相替换（代价 4 > 删+插 2）
+        assert_eq!(fuzzy_distance("2L", "8L"), 2);
+        // 弦式只精确匹配
+        assert_eq!(tolerance_for("2L", 2), 0);
+        assert_eq!(tolerance_for("2", 2), 0);
+        assert_eq!(is_chord("2L"), true);
+        assert_eq!(is_chord("42"), false);
+    }
+
+    #[test]
     fn tolerance_guard() {
-        assert_eq!(tolerance_for("2", 2), 0); // 单方向只精确
         assert_eq!(tolerance_for("42", 2), 1);
         assert_eq!(tolerance_for("468", 2), 1);
     }

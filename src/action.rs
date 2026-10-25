@@ -9,6 +9,57 @@ pub fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
     l.push(line);
 }
 
+/// 前台窗口上下文：(进程名小写无 .exe，是否桌面/公共区域)。
+/// 供作用域解析与"粘贴并转到"的浏览器判定使用。
+pub fn foreground_context() -> (Option<String>, bool) {
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winbase::QueryFullProcessImageNameW;
+        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+        use winapi::um::winuser::{GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId};
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return (None, false);
+        }
+        // 桌面/公共区域判定：Progman / WorkerW
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(hwnd, cls.as_mut_ptr(), 64);
+        let cls_name = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+        let is_desktop = cls_name == "Progman" || cls_name == "WorkerW";
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let proc_name = if pid != 0 {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                None
+            } else {
+                let mut buf = [0u16; 512];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+                CloseHandle(h);
+                if ok != 0 {
+                    let full = String::from_utf16_lossy(&buf[..len as usize]);
+                    full.rsplit(['\\', '/'])
+                        .next()
+                        .map(|s| s.trim_end_matches(".exe").trim_end_matches(".EXE").to_ascii_lowercase())
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        (proc_name, is_desktop)
+    }
+    #[cfg(not(windows))]
+    {
+        (None, false)
+    }
+}
+
 pub fn execute(a: &ActionDef, logs: &Arc<Mutex<Vec<String>>>) {
     let result: Result<String, String> = match a {
         ActionDef::RunApp { path, args } => {
@@ -34,11 +85,35 @@ pub fn execute(a: &ActionDef, logs: &Arc<Mutex<Vec<String>>>) {
         ActionDef::Volume { op } => volume_op(op),
         ActionDef::System { op } => system_op(op),
         ActionDef::Browser { op } => browser_op(op),
+        ActionDef::PasteAndGo => paste_and_go(),
         ActionDef::Script { code } => run_script(code),
     };
     match result {
         Ok(msg) => push_log(logs, format!("[动作] {}: {}", a.kind_name(), msg)),
         Err(e) => push_log(logs, format!("[动作] {} 失败: {}", a.kind_name(), e)),
+    }
+}
+
+/// 常见浏览器进程名（小写无 .exe）
+const BROWSERS: [&str; 12] = [
+    "msedge", "chrome", "chromium", "firefox", "opera", "brave", "vivaldi", "360se", "360chrome",
+    "qqbrowser", "sogouexplorer", "maxthon",
+];
+
+/// 粘贴并转到：浏览器 → 定位地址栏(Ctrl+L) → 粘贴(Ctrl+V) → 回车；
+/// 非浏览器 → 普通 Ctrl+V。
+fn paste_and_go() -> Result<String, String> {
+    let (proc_name, _) = foreground_context();
+    let is_browser = proc_name.as_deref().map_or(false, |p| BROWSERS.contains(&p));
+    if is_browser {
+        send_combo("ctrl+l")?;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        send_combo("ctrl+v")?;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        tap_vk(0x0D)?; // Enter
+        Ok("地址栏粘贴并跳转".into())
+    } else {
+        send_combo("ctrl+v")
     }
 }
 
@@ -119,6 +194,85 @@ fn window_op(op: &str) -> Result<String, String> {
     }
 }
 
+/// 在当前光标位置注入一次中键单击（浏览器：打开悬停链接到新标签页）
+#[cfg(windows)]
+fn middle_click_at_cursor() -> Result<String, String> {
+    use winapi::ctypes::c_int;
+    use winapi::um::winuser::{
+        SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    };
+    let mk = |flag: u32| -> INPUT {
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.type_ = INPUT_MOUSE;
+        unsafe {
+            input.u.mi_mut().dwFlags = flag;
+        }
+        input
+    };
+    let mut events = [mk(MOUSEEVENTF_MIDDLEDOWN), mk(MOUSEEVENTF_MIDDLEUP)];
+    let sent = unsafe {
+        SendInput(2, events.as_mut_ptr(), std::mem::size_of::<INPUT>() as c_int)
+    };
+    if sent == 2 {
+        Ok("中键单击完成".into())
+    } else {
+        Err("中键单击被系统拦截".into())
+    }
+}
+
+/// 在当前光标位置注入一次 Shift+左键单击（浏览器：打开悬停链接到新窗口）
+#[cfg(windows)]
+fn shift_left_click() -> Result<String, String> {
+    use winapi::ctypes::c_int;
+    use winapi::um::winuser::{
+        SendInput, INPUT, INPUT_MOUSE, INPUT_KEYBOARD, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        VK_SHIFT,
+    };
+    let mut mouse = |flag: u32| -> INPUT {
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.type_ = INPUT_MOUSE;
+        unsafe {
+            input.u.mi_mut().dwFlags = flag;
+        }
+        input
+    };
+    let mut events: Vec<INPUT> = Vec::new();
+    let mut k: INPUT = unsafe { std::mem::zeroed() };
+    k.type_ = INPUT_KEYBOARD;
+    unsafe {
+        *k.u.ki_mut() = winapi::um::winuser::KEYBDINPUT {
+            wVk: VK_SHIFT as u16,
+            wScan: 0,
+            dwFlags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+    }
+    events.push(k);
+    events.push(mouse(MOUSEEVENTF_LEFTDOWN));
+    events.push(mouse(MOUSEEVENTF_LEFTUP));
+    let mut ku: INPUT = unsafe { std::mem::zeroed() };
+    ku.type_ = INPUT_KEYBOARD;
+    unsafe {
+        *ku.u.ki_mut() = winapi::um::winuser::KEYBDINPUT {
+            wVk: VK_SHIFT as u16,
+            wScan: 0,
+            dwFlags: winapi::um::winuser::KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+    }
+    events.push(ku);
+    let sent = unsafe {
+        SendInput(events.len() as u32, events.as_mut_ptr(), std::mem::size_of::<INPUT>() as c_int)
+    };
+    if sent == events.len() as u32 {
+        Ok("Shift+单击完成".into())
+    } else {
+        Err("Shift+单击被系统拦截".into())
+    }
+}
+
 /// 解析 "ctrl+shift+t" 形式的组合键并注入：修饰键按下 → 点按主键 → 修饰键抬起
 #[cfg(windows)]
 fn send_combo(combo: &str) -> Result<String, String> {
@@ -130,9 +284,7 @@ fn send_combo(combo: &str) -> Result<String, String> {
         return Err("空组合键".into());
     }
     let vk_of = |name: &str| -> Option<u16> {
-        use winapi::um::winuser::{
-            VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT,
-        };
+        use winapi::um::winuser::{VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT};
         Some(match name.to_ascii_uppercase().as_str() {
             "CTRL" | "CONTROL" => VK_CONTROL as u16,
             "SHIFT" => VK_SHIFT as u16,
@@ -164,7 +316,11 @@ fn send_combo(combo: &str) -> Result<String, String> {
         events.push(key_event(vk, true));
     }
     let sent = unsafe {
-        SendInput(events.len() as u32, events.as_mut_ptr(), std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int)
+        SendInput(
+            events.len() as u32,
+            events.as_mut_ptr(),
+            std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int,
+        )
     };
     if sent == events.len() as u32 {
         Ok(format!("组合键 {combo} 已发送"))
@@ -183,7 +339,9 @@ fn tap_vk(vk: u16) -> Result<String, String> {
     use winapi::ctypes::c_int;
     use winapi::um::winuser::SendInput;
     let mut events = [key_event(vk, false), key_event(vk, true)];
-    let sent = unsafe { SendInput(2u32, events.as_mut_ptr(), std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int) };
+    let sent = unsafe {
+        SendInput(2u32, events.as_mut_ptr(), std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int)
+    };
     if sent == 2 {
         Ok("完成".into())
     } else {
@@ -217,6 +375,13 @@ fn browser_op(op: &str) -> Result<String, String> {
             "back" => tap_vk(VK_BROWSER_BACK as u16),
             "forward" => tap_vk(VK_BROWSER_FORWARD as u16),
             "refresh" => tap_vk(VK_BROWSER_REFRESH as u16),
+            "stop" => tap_vk(0x1B), // ESC
+            "open_link_new_tab" => middle_click_at_cursor(),
+            "open_link_new_window" => shift_left_click(),
+            // Edge/Chrome 未提供这两项的系统级快捷键，全局键鼠模拟无法实现
+            "close_tabs_right" | "close_other_tabs" => {
+                Err("浏览器未提供系统级快捷键，该动作暂不支持（可在编辑器中改绑其他动作）".into())
+            }
             other => Err(format!("未知浏览器操作: {other}")),
         }
     }
@@ -308,8 +473,8 @@ fn key_event(vk: u16, up: bool) -> winapi::um::winuser::INPUT {
 
 #[cfg(windows)]
 fn send_keys(spec: &str) -> Result<String, String> {
-    use winapi::um::winuser::{SendInput, VK_SHIFT};
     use winapi::ctypes::c_int;
+    use winapi::um::winuser::{SendInput, VK_SHIFT};
 
     let mut events: Vec<winapi::um::winuser::INPUT> = Vec::new();
     let mut chars = spec.chars().peekable();
@@ -353,7 +518,13 @@ fn send_keys(spec: &str) -> Result<String, String> {
     if events.is_empty() {
         return Ok("空按键序列".into());
     }
-    let sent = unsafe { SendInput(events.len() as u32, events.as_mut_ptr(), std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int) };
+    let sent = unsafe {
+        SendInput(
+            events.len() as u32,
+            events.as_mut_ptr(),
+            std::mem::size_of::<winapi::um::winuser::INPUT>() as c_int,
+        )
+    };
     if sent == events.len() as u32 {
         Ok(format!("发送 {} 个按键事件", sent))
     } else {

@@ -10,11 +10,20 @@ pub struct Ctx {
     pub paused: Arc<AtomicBool>,
     /// UI 线程启动后填入；引擎用它请求重绘，让日志即时显示
     pub ui_ctx: Arc<OnceLock<eframe::egui::Context>>,
+    /// 全局捕获提示：(文案, 出现时刻)，UI 展示 ~1.2 秒后自动消失
+    pub toast: Arc<Mutex<Option<(String, std::time::Instant)>>>,
 }
 
 impl Ctx {
     pub fn log(&self, line: String) {
         action::push_log(&self.logs, line);
+        if let Some(c) = self.ui_ctx.get() {
+            c.request_repaint();
+        }
+    }
+
+    pub fn set_toast(&self, text: String) {
+        *self.toast.lock().unwrap() = Some((text, std::time::Instant::now()));
         if let Some(c) = self.ui_ctx.get() {
             c.request_repaint();
         }
@@ -54,8 +63,42 @@ pub fn match_gestures<'a>(
     (best, nearest)
 }
 
-/// 钩子线程收到完整轨迹后调用（已在新线程中）。
-pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>) {
+/// 作用域是否命中：scope 支持逗号分隔多个进程名关键字，双向包含即命中
+fn scope_matches(gd: &GestureDef, proc_name: Option<&str>) -> bool {
+    if gd.is_global() {
+        return true;
+    }
+    let Some(p) = proc_name else { return false };
+    gd.scope
+        .to_ascii_lowercase()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|s| p.contains(s) || s.contains(p))
+}
+
+/// 在一组手势里尝试匹配并执行。命中返回 true。
+fn attempt(ctx: &Ctx, seq: &str, gestures: &[GestureDef], tolerance: u32) -> bool {
+    let (best, _) = match_gestures(seq, gestures, tolerance);
+    if let Some((gd, d)) = best {
+        let arrow = gesture::arrows(&gd.pattern);
+        ctx.set_toast(format!("✓ 已捕获：「{}」{arrow}", gd.name));
+        ctx.log(format!(
+            "[手势] 命中「{}」{arrow}（画出 {}，容差差距 {d}）→ 执行动作",
+            gd.name,
+            gesture::arrows(seq)
+        ));
+        action::execute(&gd.action, &ctx.logs);
+        true
+    } else {
+        false
+    }
+}
+
+/// 钩子线程收到完整轨迹后调用（已在新线程中）。chord = 期间单击过左键。
+/// 作用域规则：能识别所画窗口的进程 → 先匹配该程序专属手势（scope 非空且进程命中），
+/// 没命中再回退全局手势；桌面/公共区域（Progman/WorkerW）直接用全局手势。
+pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>, chord: bool) {
     if ctx.paused.load(Ordering::Relaxed) {
         return;
     }
@@ -63,26 +106,48 @@ pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>) {
     let (tolerance, gestures) = (cfg.fuzzy_tolerance, cfg.gestures.clone());
     drop(cfg);
 
-    let seq = gesture::sequence_from_i32(&pts, SEGMENT_PX);
+    let mut seq = gesture::sequence_from_i32(&pts, SEGMENT_PX);
+    if chord {
+        seq.push('L');
+    }
     if seq.is_empty() {
         return;
     }
-    let (best, nearest) = match_gestures(&seq, &gestures, tolerance);
-    match best {
-        Some((gd, d)) => {
-            let arrow = gesture::arrows(&gd.pattern);
-            ctx.log(format!(
-                "[手势] 命中「{}」{arrow}（画出 {}，容差差距 {d}）→ 执行动作",
-                gd.name,
-                gesture::arrows(&seq)
-            ));
-            action::execute(&gd.action, &ctx.logs);
-        }
-        None => {
-            let near = nearest
-                .map(|(gd, d)| format!("最接近「{}」差 {d}", gd.name))
-                .unwrap_or_else(|| "没有启用的手势".into());
-            ctx.log(format!("[手势] 未匹配：{}（{near}）", gesture::arrows(&seq)));
+
+    let (proc_name, is_desktop) = action::foreground_context();
+
+    // 1) 应用专属手势（桌面/公共区域跳过）
+    if !is_desktop {
+        let app_gestures: Vec<GestureDef> = gestures
+            .iter()
+            .filter(|g| !g.is_global() && scope_matches(g, proc_name.as_deref()))
+            .cloned()
+            .collect();
+        if attempt(ctx, &seq, &app_gestures, tolerance) {
+            return;
         }
     }
+
+    // 2) 全局手势
+    let global_gestures: Vec<GestureDef> =
+        gestures.iter().filter(|g| g.is_global()).cloned().collect();
+    if attempt(ctx, &seq, &global_gestures, tolerance) {
+        return;
+    }
+
+    // 3) 都没命中：给出最接近提示（在全量手势里找）
+    let (_, nearest) = match_gestures(&seq, &gestures, tolerance);
+    let scope_desc = if is_desktop {
+        "桌面".to_string()
+    } else {
+        proc_name.unwrap_or_else(|| "未知程序".into())
+    };
+    let near = nearest
+        .map(|(gd, d)| format!("最接近「{}」差 {d}", gd.name))
+        .unwrap_or_else(|| "没有启用的手势".into());
+    ctx.set_toast(format!("已捕获 {}，未匹配", gesture::arrows(&seq)));
+    ctx.log(format!(
+        "[手势] 未匹配：{}（作用域 {scope_desc}；{near}）",
+        gesture::arrows(&seq)
+    ));
 }

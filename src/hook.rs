@@ -4,6 +4,10 @@
 //! 若只是普通点击 → 由后台线程补发一次完整的按下+抬起，上下文菜单照常弹出。
 //! 好处：应用从头到尾收不到"悬空的按下"，不会再出现拖拽状态卡死、
 //! 需要再点一下右键才能结束的问题。
+//!
+//! 弦式手势：触发键按住期间的左键单击被吞掉并记为 'L' 段（不穿透给目标程序），
+//! 手势结束时随轨迹一起交给引擎，形成如 "2L"（下拖+左点）的组合。
+//!
 //! 热路径上不读 config RwLock：threshold 在按下时缓存到原子量（f32 位模式一致存取）。
 
 use crate::config::MouseButton;
@@ -17,6 +21,10 @@ struct HookState {
     gesturing: AtomicBool,
     /// 触发键按下时缓存的起手势阈值（f32 位模式），移动热路径不再读 config
     threshold_bits: AtomicU32,
+    /// 本次按住触发键期间发生过左键单击（弦式标记）
+    left_clicked: AtomicBool,
+    /// 已吞掉左键按下（对应抬起也要吞掉，保持事件配对）
+    left_swallowed: AtomicBool,
 }
 
 static STATE: OnceLock<HookState> = OnceLock::new();
@@ -42,6 +50,8 @@ unsafe fn run_hook(ctx: Ctx) {
         points: Mutex::new(Vec::new()),
         gesturing: AtomicBool::new(false),
         threshold_bits: AtomicU32::new(30.0f32.to_bits()),
+        left_clicked: AtomicBool::new(false),
+        left_swallowed: AtomicBool::new(false),
     });
     let _ = CTX.set(ctx);
 
@@ -94,8 +104,8 @@ fn inject_click_async(right: bool, x: i32, y: i32) {
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use winapi::um::winuser::{
-        CallNextHookEx, MSLLHOOKSTRUCT, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-        WM_RBUTTONDOWN, WM_RBUTTONUP,
+        CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+        WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     let pass = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
@@ -104,7 +114,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
         return pass();
     }
 
-    let (Some(state), Some(ctx)) = (STATE.get(), CTX.get()) else {
+    let (Some(state), Some(_ctx)) = (STATE.get(), CTX.get()) else {
         return pass();
     };
 
@@ -114,18 +124,35 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
 
     match msg {
         m if m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN => {
-            let want = ctx.config.read().unwrap().trigger;
+            let want = _ctx.config.read().unwrap().trigger;
             let matched = match want {
                 MouseButton::Right => m == WM_RBUTTONDOWN,
                 MouseButton::Middle => m == WM_MBUTTONDOWN,
             };
             if matched {
                 // 延迟触发：吞掉按下，等松开时再决定是手势还是普通点击
-                let th = ctx.config.read().unwrap().threshold_px;
+                let th = _ctx.config.read().unwrap().threshold_px;
                 state.threshold_bits.store(th.to_bits(), Ordering::Relaxed);
                 *state.start.lock().unwrap() = Some((x, y));
                 state.points.lock().unwrap().clear();
                 state.gesturing.store(false, Ordering::Relaxed);
+                state.left_clicked.store(false, Ordering::Relaxed);
+                state.left_swallowed.store(false, Ordering::Relaxed);
+                return 1;
+            }
+            pass()
+        }
+        // 弦式：触发键按住期间，左键单击被吞掉并记为 'L' 段
+        WM_LBUTTONDOWN => {
+            if state.start.lock().unwrap().is_some() {
+                state.left_clicked.store(true, Ordering::Relaxed);
+                state.left_swallowed.store(true, Ordering::Relaxed);
+                return 1;
+            }
+            pass()
+        }
+        WM_LBUTTONUP => {
+            if state.left_swallowed.swap(false, Ordering::Relaxed) {
                 return 1;
             }
             pass()
@@ -154,15 +181,22 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
                 if was_gesturing {
                     // 手势结束：立即把轨迹交给引擎检测；吞掉抬起（应用从没收到过按下）
                     let pts = state.points.lock().unwrap().clone();
+                    let chord = state.left_clicked.swap(false, Ordering::Relaxed);
                     std::thread::spawn(move || {
                         if let Some(c) = CTX.get() {
-                            engine::handle_path(c, pts);
+                            engine::handle_path(c, pts, chord);
                         }
                     });
                     return 1;
                 }
                 // 普通点击：补发完整的按下+抬起，恢复上下文菜单等原生行为
                 let right = msg == WM_RBUTTONUP;
+                let chord = state.left_clicked.swap(false, Ordering::Relaxed);
+                if chord {
+                    // 按住触发键时点过左键但没画手势：左键事件已消费，不补发
+                    // 避免把误吞的左键变成一次突兀的右键菜单点击
+                    return 1;
+                }
                 inject_click_async(right, x, y);
                 return 1;
             }
