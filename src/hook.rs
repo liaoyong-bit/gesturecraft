@@ -1,8 +1,10 @@
 //! Windows 低级鼠标钩子线程。
-//! 触发键按下 → 位移超过阈值进入手势模式（光标照常移动，仅松开时吞掉 UP
-//! 防止弹出上下文菜单）→ 完整轨迹交给引擎线程匹配，并请求 UI 重绘显示日志。
-//! 钩子回调内绝不等待长锁：threshold 在触发键按下时一次性缓存到原子变量，
-//! 移动事件路径上只碰无争用的 Mutex/Atomic，避免 Windows 因回调超时移除钩子。
+//! 「延迟触发」设计：触发键"按下"即被吞掉，应用层完全感知不到；
+//! 松开时若位移超过阈值 → 判定为手势，轨迹交给引擎匹配（无菜单弹出）；
+//! 若只是普通点击 → 由后台线程补发一次完整的按下+抬起，上下文菜单照常弹出。
+//! 好处：应用从头到尾收不到"悬空的按下"，不会再出现拖拽状态卡死、
+//! 需要再点一下右键才能结束的问题。
+//! 热路径上不读 config RwLock：threshold 在按下时缓存到原子量（f32 位模式一致存取）。
 
 use crate::config::MouseButton;
 use crate::engine::{self, Ctx};
@@ -13,12 +15,14 @@ struct HookState {
     start: Mutex<Option<(i32, i32)>>,
     points: Mutex<Vec<(i32, i32)>>,
     gesturing: AtomicBool,
-    /// 触发键按下时缓存的起手势阈值（像素），移动热路径不再读 config
-    threshold: AtomicU32,
+    /// 触发键按下时缓存的起手势阈值（f32 位模式），移动热路径不再读 config
+    threshold_bits: AtomicU32,
 }
 
 static STATE: OnceLock<HookState> = OnceLock::new();
 static CTX: OnceLock<Ctx> = OnceLock::new();
+/// 注入补偿点击期间置位，钩子对注入事件直接放行，避免自触发
+static INJECTING: AtomicBool = AtomicBool::new(false);
 
 pub fn start_hook_thread(ctx: Ctx) {
     std::thread::Builder::new()
@@ -37,7 +41,7 @@ unsafe fn run_hook(ctx: Ctx) {
         start: Mutex::new(None),
         points: Mutex::new(Vec::new()),
         gesturing: AtomicBool::new(false),
-        threshold: AtomicU32::new(30),
+        threshold_bits: AtomicU32::new(30.0f32.to_bits()),
     });
     let _ = CTX.set(ctx);
 
@@ -53,18 +57,55 @@ unsafe fn run_hook(ctx: Ctx) {
     UnhookWindowsHookEx(hook);
 }
 
+/// 普通点击补偿：后台线程注入完整按下+抬起（钩子内不能阻塞等待）
+fn inject_click_async(right: bool, x: i32, y: i32) {
+    std::thread::spawn(move || {
+        use winapi::ctypes::c_int;
+        use winapi::um::winuser::{
+            SendInput, SetCursorPos, INPUT, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        };
+        unsafe {
+            SetCursorPos(x, y);
+        }
+        let (down_flag, up_flag) = if right {
+            (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+        } else {
+            (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP)
+        };
+        let mk = |flag: u32| -> INPUT {
+            let mut input: INPUT = unsafe { std::mem::zeroed() };
+            input.type_ = 0; // INPUT_MOUSE
+            unsafe {
+                input.u.mi_mut().dwFlags = flag;
+            }
+            input
+        };
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        INJECTING.store(true, Ordering::SeqCst);
+        unsafe {
+            let mut ev = [mk(down_flag), mk(up_flag)];
+            SendInput(2, ev.as_mut_ptr(), std::mem::size_of::<INPUT>() as c_int);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        INJECTING.store(false, Ordering::SeqCst);
+    });
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use winapi::um::winuser::{
         CallNextHookEx, MSLLHOOKSTRUCT, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
         WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
-    if code < 0 {
-        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    let pass = || CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+
+    if code < 0 || INJECTING.load(Ordering::SeqCst) {
+        return pass();
     }
 
     let (Some(state), Some(ctx)) = (STATE.get(), CTX.get()) else {
-        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+        return pass();
     };
 
     let info = &*(lparam as *const MSLLHOOKSTRUCT);
@@ -73,26 +114,28 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
 
     match msg {
         m if m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN => {
-            // 只有配置的触发键才进入录制；threshold 此时读一次 config
             let want = ctx.config.read().unwrap().trigger;
             let matched = match want {
                 MouseButton::Right => m == WM_RBUTTONDOWN,
                 MouseButton::Middle => m == WM_MBUTTONDOWN,
             };
             if matched {
+                // 延迟触发：吞掉按下，等松开时再决定是手势还是普通点击
                 let th = ctx.config.read().unwrap().threshold_px;
-                state.threshold.store(th as u32, Ordering::Relaxed);
+                state.threshold_bits.store(th.to_bits(), Ordering::Relaxed);
                 *state.start.lock().unwrap() = Some((x, y));
                 state.points.lock().unwrap().clear();
                 state.gesturing.store(false, Ordering::Relaxed);
+                return 1;
             }
+            pass()
         }
         WM_MOUSEMOVE => {
             if state.gesturing.load(Ordering::Relaxed) {
                 state.points.lock().unwrap().push((x, y));
-                // 放行移动事件：光标照常跟随，不再冻结
+                pass() // 光标照常跟随
             } else if let Some((sx, sy)) = *state.start.lock().unwrap() {
-                let threshold = f32::from_bits(state.threshold.load(Ordering::Relaxed));
+                let threshold = f32::from_bits(state.threshold_bits.load(Ordering::Relaxed));
                 let d = ((x - sx) as f32).hypot((y - sy) as f32);
                 if d >= threshold {
                     state.gesturing.store(true, Ordering::Relaxed);
@@ -100,24 +143,31 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
                     pts.push((sx, sy));
                     pts.push((x, y));
                 }
+                pass()
+            } else {
+                pass()
             }
         }
-        m if m == WM_RBUTTONUP || WM_MBUTTONUP == m => {
+        m if m == WM_RBUTTONUP || m == WM_MBUTTONUP => {
             let was_gesturing = state.gesturing.swap(false, Ordering::Relaxed);
-            let had_start = state.start.lock().unwrap().take().is_some();
-            if was_gesturing {
-                let pts = state.points.lock().unwrap().clone();
-                std::thread::spawn(move || {
-                    if let Some(c) = CTX.get() {
-                        engine::handle_path(c, pts);
-                    }
-                });
-                return 1; // 吞掉抬起，防止弹菜单
+            if state.start.lock().unwrap().take().is_some() {
+                if was_gesturing {
+                    // 手势结束：立即把轨迹交给引擎检测；吞掉抬起（应用从没收到过按下）
+                    let pts = state.points.lock().unwrap().clone();
+                    std::thread::spawn(move || {
+                        if let Some(c) = CTX.get() {
+                            engine::handle_path(c, pts);
+                        }
+                    });
+                    return 1;
+                }
+                // 普通点击：补发完整的按下+抬起，恢复上下文菜单等原生行为
+                let right = msg == WM_RBUTTONUP;
+                inject_click_async(right, x, y);
+                return 1;
             }
-            let _ = had_start;
+            pass()
         }
-        _ => {}
+        _ => pass(),
     }
-
-    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
 }
