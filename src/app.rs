@@ -38,7 +38,7 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) {
     egui::Frame::none()
         .fill(CARD_BG)
         .rounding(egui::Rounding::same(10.0))
-        .stroke(egui::Stroke::new(1.0, CARD_STROKE))
+        .stroke(egui::Stroke::new(1.0_f32, CARD_STROKE))
         .shadow(egui::epaint::Shadow {
             offset: egui::vec2(0.0, 2.0),
             blur: 10.0,
@@ -150,9 +150,9 @@ fn setup_style(ctx: &egui::Context) {
     style.visuals.widgets.inactive.rounding = r;
     style.visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
     style.visuals.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(214, 220, 232));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 220, 232));
     style.visuals.selection.bg_fill = ACCENT;
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
     style.visuals.window_rounding = egui::Rounding::same(10.0);
     style.visuals.extreme_bg_color = egui::Color32::from_rgb(238, 242, 248);
     ctx.set_style(style);
@@ -271,7 +271,7 @@ impl UiApp {
                     if ui
                         .add_sized(
                             [ui.available_width(), 34.0],
-                            egui::SelectableLabel::new(text),
+                            egui::SelectableLabel::new(sel, text),
                         )
                         .clicked()
                     {
@@ -389,8 +389,9 @@ impl UiApp {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add(egui::SelectableLabel::new(
+                    self.filter == "全部",
                     egui::RichText::new(format!("全部 {total}")).size(13.0),
-                ).selected(self.filter == "全部"))
+                ))
                 .clicked()
             {
                 self.filter = "全部".into();
@@ -400,7 +401,9 @@ impl UiApp {
                 let label = egui::RichText::new(format!("{cat} {}", counts[i]))
                     .size(13.0)
                     .color(fg);
-                if ui.add(egui::SelectableLabel::new(label).selected(self.filter == *cat)).clicked()
+                if ui
+                    .add(egui::SelectableLabel::new(self.filter == *cat, label))
+                    .clicked()
                 {
                     self.filter = cat.to_string();
                 }
@@ -813,7 +816,7 @@ impl UiApp {
                 self.draft.pattern = gesture::sequence_from_f32(&pts, 25.0);
             }
             if !self.pad_points.is_empty() {
-                let stroke = egui::Stroke::new(3.0, ACCENT);
+                let stroke = egui::Stroke::new(3.0_f32, ACCENT);
                 painter.add(egui::Shape::line(
                     self.pad_points.iter().map(|p| rect.min + *p).collect(),
                     stroke,
@@ -895,7 +898,9 @@ impl UiApp {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(format!("起手势位移阈值: {:.0} px", th)).color(INK);
+                ui.label(
+                    egui::RichText::new(format!("起手势位移阈值: {:.0} px", th)).color(INK),
+                );
                 ui.add(egui::Slider::new(&mut th, 10.0..=100.0));
             });
             ui.horizontal(|ui| {
@@ -989,7 +994,7 @@ impl UiApp {
                 }
             }
             if !self.test_points.is_empty() {
-                let stroke = egui::Stroke::new(3.0, ACCENT);
+                let stroke = egui::Stroke::new(3.0_f32, ACCENT);
                 painter.add(egui::Shape::line(
                     self.test_points.iter().map(|p| rect.min + *p).collect(),
                     stroke,

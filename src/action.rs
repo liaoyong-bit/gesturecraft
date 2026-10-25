@@ -228,7 +228,7 @@ fn shift_left_click() -> Result<String, String> {
         SendInput, INPUT, INPUT_MOUSE, INPUT_KEYBOARD, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         VK_SHIFT,
     };
-    let mut mouse = |flag: u32| -> INPUT {
+    let mouse = |flag: u32| -> INPUT {
         let mut input: INPUT = unsafe { std::mem::zeroed() };
         input.type_ = INPUT_MOUSE;
         unsafe {
