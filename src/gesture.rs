@@ -151,7 +151,8 @@ mod tests {
     #[test]
     fn fuzzy_close_dirs() {
         assert_eq!(fuzzy_distance("2", "1"), 1); // ↓ vs ↙ 差 45°
-        assert_eq!(fuzzy_distance("2", "8"), 4); // 相反方向
+        // 相反方向：替换代价 4 被 DP 的"删+插"（1+1=2）取代，等效于删掉重画
+        assert_eq!(fuzzy_distance("2", "8"), 2);
         assert_eq!(fuzzy_distance("82", "8"), 1); // 少画一段
         assert_eq!(fuzzy_distance("8", "82"), 1); // 多画一段
         assert_eq!(fuzzy_distance("42", "24"), 2); // 顺序画反

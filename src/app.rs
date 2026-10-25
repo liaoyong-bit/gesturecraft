@@ -43,7 +43,7 @@ pub fn run_ui(
             .with_title("GestureCraft"),
         ..Default::default()
     };
-    eframe::run_native(
+    let _ = eframe::run_native(
         "GestureCraft",
         options,
         Box::new(move |cc| {
@@ -440,7 +440,7 @@ impl UiApp {
             self.draft.pattern = gesture::sequence_from_f32(&pts, 25.0);
         }
         if !self.pad_points.is_empty() {
-            let stroke = egui::Stroke::new(3.0, egui::Color32::from_rgb(30, 100, 220));
+            let stroke = egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(30, 100, 220));
             painter.add(egui::Shape::line(
                 self.pad_points.iter().map(|p| rect.min + *p).collect(),
                 stroke,
@@ -569,7 +569,7 @@ impl UiApp {
             }
         }
         if !self.test_points.is_empty() {
-            let stroke = egui::Stroke::new(3.0, egui::Color32::from_rgb(30, 100, 220));
+            let stroke = egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(30, 100, 220));
             painter.add(egui::Shape::line(
                 self.test_points.iter().map(|p| rect.min + *p).collect(),
                 stroke,
