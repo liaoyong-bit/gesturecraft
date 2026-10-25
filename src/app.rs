@@ -103,8 +103,6 @@ pub struct UiApp {
     test_points: Vec<egui::Vec2>,
     test_result: Option<Result<String, String>>,
     status: String,
-    /// 全局捕获提示（与引擎共享，悬浮层展示 ~1.6 秒）
-    toast: Arc<Mutex<Option<(String, std::time::Instant, (i32, i32))>>>,
     /// 托盘菜单命令
     tray_rx: std::sync::mpsc::Receiver<tray::TrayCmd>,
 }
@@ -114,7 +112,6 @@ pub fn run_ui(
     logs: Arc<Mutex<Vec<String>>>,
     paused: Arc<AtomicBool>,
     ui_ctx: Arc<std::sync::OnceLock<egui::Context>>,
-    toast: Arc<Mutex<Option<(String, std::time::Instant, (i32, i32))>>>,
     tray_rx: std::sync::mpsc::Receiver<tray::TrayCmd>,
 ) {
     let options = eframe::NativeOptions {
@@ -149,7 +146,6 @@ pub fn run_ui(
                 test_points: Vec::new(),
                 test_result: None,
                 status: String::new(),
-                toast,
                 tray_rx,
             })
         }),
@@ -174,25 +170,26 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// 嵌入式中文字体：微软雅小子集（GB2312 一级常用字 3755 + 源码字符 + ASCII + 符号，约 0.9MB）。
+/// 由 tools/subset_font.py 从系统 msyh.ttc 生成；不再运行时读取系统字体（省约 19MB 内存）。
+const CJK_FONT_BYTES: &[u8] = include_bytes!("../assets/font-subset.ttf");
+
 fn load_cjk_font(ctx: &egui::Context) {
-    let candidates = [
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\simsun.ttc",
-    ];
     let mut fonts = egui::FontDefinitions::default();
-    for path in candidates {
-        if let Ok(data) = std::fs::read(path) {
-            let name = "cjk".to_string();
-            fonts.font_data.insert(name.clone(), egui::FontData::from_owned(data));
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, name);
-            break;
-        }
-    }
+    fonts.font_data.insert(
+        "cjk".to_string(),
+        egui::FontData::from_owned(CJK_FONT_BYTES.to_vec()),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "cjk".to_string());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("cjk".to_string());
     ctx.set_fonts(fonts);
 }
 
@@ -372,7 +369,6 @@ impl eframe::App for UiApp {
         }
 
         self.show_add_program_dialog(ctx);
-        self.show_overlay(ctx);
     }
 }
 
@@ -425,7 +421,7 @@ impl UiApp {
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("v0.5.1").small().color(NAV_TEXT_DIM));
+                    ui.label(egui::RichText::new("v0.5.2").small().color(NAV_TEXT_DIM));
                     ui.add_space(8.0);
                     let paused = self.paused.load(Ordering::Relaxed);
                     let label = if paused { "▶  恢复监听" } else { "⏸  暂停监听" };
@@ -455,98 +451,6 @@ impl UiApp {
             });
     }
 
-    fn screen_size() -> (f32, f32) {
-        #[cfg(windows)]
-        unsafe {
-            use winapi::um::winuser::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-            (
-                GetSystemMetrics(SM_CXSCREEN) as f32,
-                GetSystemMetrics(SM_CYSCREEN) as f32,
-            )
-        }
-        #[cfg(not(windows))]
-        {
-            (1920.0, 1080.0)
-        }
-    }
-
-    /// 全屏悬浮提示：独立置顶窗口（主窗口隐藏到托盘时也可见），
-    /// 跟随手势落点，固定显示 1.6 秒，末段淡出。
-    fn show_overlay(&mut self, ctx: &egui::Context) {
-        const OVERLAY_MS: u128 = 1600;
-        let msg = {
-            let mut t = self.toast.lock().unwrap();
-            match t.as_ref() {
-                Some((s, t0, p)) if t0.elapsed().as_millis() < OVERLAY_MS => {
-                    Some((s.clone(), t0.elapsed().as_millis(), *p))
-                }
-                Some(_) => {
-                    *t = None;
-                    None
-                }
-                None => None,
-            }
-        };
-        let Some((text, elapsed, pos)) = msg else {
-            return;
-        };
-        let (sw, sh) = Self::screen_size();
-        let (w, h) = (430.0_f32, 86.0_f32);
-        let ok = text.starts_with('✓');
-        let (mut x, mut y) = if pos.0 == 0 && pos.1 == 0 {
-            (sw / 2.0 - w / 2.0, sh * 0.40 - h / 2.0)
-        } else {
-            (pos.0 as f32 - w / 2.0, pos.1 as f32 - h - 34.0)
-        };
-        x = x.clamp(8.0, (sw - w - 8.0).max(8.0));
-        y = y.clamp(8.0, (sh - h - 8.0).max(8.0));
-        let alpha: f32 = if elapsed > 1300 { 0.45 } else { 1.0 };
-        let a8 = (alpha * 240.0) as u8;
-        let (fill, edge) = if ok {
-            (
-                egui::Color32::from_rgba_unmultiplied(14, 58, 30, a8),
-                egui::Color32::from_rgba_unmultiplied(70, 190, 110, a8),
-            )
-        } else {
-            (
-                egui::Color32::from_rgba_unmultiplied(76, 20, 20, a8),
-                egui::Color32::from_rgba_unmultiplied(230, 110, 110, a8),
-            )
-        };
-        ctx.show_viewport_immediate(
-            egui::ViewportId(egui::Id::new("gc_overlay")),
-            egui::ViewportBuilder::default()
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_always_on_top()
-                .with_mouse_passthrough(true)
-                .with_position(egui::pos2(x, y))
-                .with_inner_size([w, h]),
-            move |ctx, _class| {
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(fill)
-                            .rounding(egui::Rounding::same(16.0))
-                            .stroke(egui::Stroke::new(2.0_f32, edge))
-                            .inner_margin(egui::Margin::same(12.0)),
-                    )
-                    .show(ctx, |ui| {
-                        ui.set_min_size(egui::vec2(w - 24.0, h - 24.0));
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                egui::RichText::new(&text)
-                                    .strong()
-                                    .size(20.0)
-                                    .color(egui::Color32::WHITE),
-                            );
-                        });
-                    });
-            },
-        );
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
-
     // ---------- 作用域双栏 ----------
 
     fn program_display(key: &str) -> String {
@@ -571,70 +475,58 @@ impl UiApp {
         });
         ui.add_space(6.0);
 
-        // 全局
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            let sel = self.scope_sel == GLOBAL_KEY;
-            let text = egui::RichText::new("🌐  全局").size(14.0).color(if sel {
-                egui::Color32::WHITE
-            } else {
-                INK
-            });
-            if ui
-                .add_sized([ui.available_width() - 16.0, 32.0], egui::SelectableLabel::new(sel, text))
-                .clicked()
-            {
-                self.scope_sel = GLOBAL_KEY.to_string();
-            }
-        });
-        ui.add_space(8.0);
-
-        // 程序（全部平级，无层级）
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("程序").small().strong().color(MUTED));
-        });
-        ui.add_space(4.0);
         let programs: Vec<String> = {
             let cfg = self.config.read().unwrap();
             cfg.programs.clone()
         };
-        for key in &programs {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                let sel = self.scope_sel == *key;
-                let disp = Self::program_display(key);
-                let text = egui::RichText::new(format!("🗔  {disp}"))
-                    .size(13.5)
+
+        // 两列 Grid：名称列 / 移除按钮列，列宽由最宽行决定 → 所有行左缘严格对齐
+        egui::Grid::new("scope_grid")
+            .num_columns(2)
+            .spacing([6.0, 3.0])
+            .show(ui, |ui| {
+                // 全局
+                let sel = self.scope_sel == GLOBAL_KEY;
+                let text = egui::RichText::new("全局")
+                    .size(14.0)
                     .color(if sel { egui::Color32::WHITE } else { INK });
+                if ui.selectable_label(sel, text).clicked() {
+                    self.scope_sel = GLOBAL_KEY.to_string();
+                }
+                ui.end_row();
+
+                // 程序（全部平级，无层级）
+                for key in &programs {
+                    let sel = self.scope_sel == *key;
+                    let disp = Self::program_display(key);
+                    let text = egui::RichText::new(disp)
+                        .size(13.5)
+                        .color(if sel { egui::Color32::WHITE } else { INK });
+                    if ui.selectable_label(sel, text).clicked() {
+                        self.scope_sel = key.clone();
+                    }
+                    if ui.small_button("×").on_hover_text("移除该程序作用域").clicked() {
+                        let mut cfg = self.config.write().unwrap();
+                        cfg.programs.retain(|k| k != key);
+                        cfg.gestures.retain(|g| g.scope != *key);
+                        let _ = cfg.save();
+                        drop(cfg);
+                        if self.scope_sel == *key {
+                            self.scope_sel = GLOBAL_KEY.to_string();
+                        }
+                    }
+                    ui.end_row();
+                }
+
                 if ui
-                    .add_sized([ui.available_width() - 30.0, 28.0], egui::SelectableLabel::new(sel, text))
+                    .add(egui::Button::new(egui::RichText::new("＋ 添加程序").size(13.0)))
                     .clicked()
                 {
-                    self.scope_sel = key.clone();
+                    self.show_add_program = true;
+                    self.prog_query.clear();
                 }
-                if ui.small_button("✕").on_hover_text("移除该程序作用域").clicked() {
-                    let mut cfg = self.config.write().unwrap();
-                    cfg.programs.retain(|k| k != key);
-                    cfg.gestures.retain(|g| g.scope != *key);
-                    let _ = cfg.save();
-                    if self.scope_sel == *key {
-                        self.scope_sel = GLOBAL_KEY.to_string();
-                    }
-                }
+                ui.end_row();
             });
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            if ui
-                .add_sized([ui.available_width() - 16.0, 30.0], egui::Button::new("＋ 添加程序"))
-                .clicked()
-            {
-                self.show_add_program = true;
-                self.prog_query.clear();
-            }
-        });
 
         // 捕捉目标
         ui.add_space(14.0);
@@ -658,7 +550,7 @@ impl UiApp {
                 }
                 if ui
                     .radio(mode == TargetMode::UnderCursor, "鼠标所指窗口")
-                    .on_hover_text("手势按落点处鼠标所指的程序匹配")
+                    .on_hover_text("按手势起点的窗口匹配，执行动作前先单击该窗口将其激活")
                     .clicked()
                 {
                     mode = TargetMode::UnderCursor;

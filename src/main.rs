@@ -9,6 +9,7 @@ mod config;
 mod engine;
 mod gesture;
 mod hook;
+mod overlay;
 mod tray;
 
 use std::sync::atomic::AtomicBool;
@@ -19,8 +20,6 @@ fn main() {
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let paused = Arc::new(AtomicBool::new(false));
     let ui_ctx: Arc<std::sync::OnceLock<eframe::egui::Context>> = Arc::new(Default::default());
-    let toast: Arc<Mutex<Option<(String, std::time::Instant, (i32, i32))>>> =
-        Arc::new(Mutex::new(None));
 
     let (tray_tx, tray_rx) = std::sync::mpsc::channel::<tray::TrayCmd>();
     tray::start_tray(tray_tx);
@@ -31,8 +30,7 @@ fn main() {
         logs: logs.clone(),
         paused: paused.clone(),
         ui_ctx: ui_ctx.clone(),
-        toast: toast.clone(),
     });
 
-    app::run_ui(config, logs, paused, ui_ctx, toast, tray_rx);
+    app::run_ui(config, logs, paused, ui_ctx, tray_rx);
 }

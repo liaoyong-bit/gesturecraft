@@ -1,6 +1,6 @@
 [package]
 name = "gesturecraft"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "A native Windows mouse-gesture tool with an original Rust implementation. Inspired by the feature concepts of WGestures 2; no original code or assets are used."
 license = "MIT"
@@ -22,6 +22,7 @@ winapi = { version = "0.3", features = [
     "processthreadsapi",
     "handleapi",
     "shellapi",
+    "wingdi",
     "impl-default",
 ] }
 

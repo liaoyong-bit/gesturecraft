@@ -1,4 +1,6 @@
-//! 系统托盘常驻：Shell_NotifyIconW + 隐藏消息窗口。
+//! 系统托盘常驻：Shell_NotifyIconW + 隐藏窗口。
+//! 注意：必须用普通隐藏窗口（不能是 HWND_MESSAGE 的 message-only 窗口），
+//! 否则收不到托盘回调、TrackPopupMenu 也无法正常工作。
 //! 菜单命令经 mpsc 发给 UI 线程（显示主窗口 / 暂停恢复 / 退出）。
 
 use std::sync::mpsc::Sender;
@@ -45,7 +47,7 @@ unsafe fn run() {
     use winapi::um::libloaderapi::GetModuleHandleW;
     use winapi::um::winuser::{
         CreateWindowExW, DispatchMessageW, GetMessageW, RegisterClassW, TranslateMessage,
-        HWND_MESSAGE, MSG, WNDCLASSW,
+        MSG, WNDCLASSW,
     };
 
     let class_name: Vec<u16> = "GestureCraftTray\0".encode_utf16().collect();
@@ -57,6 +59,8 @@ unsafe fn run() {
     wc.lpszClassName = class_name.as_ptr();
     RegisterClassW(&wc);
 
+    // 普通隐藏窗口（不带 WS_VISIBLE，从不 ShowWindow）：
+    // message-only 窗口收不到托盘回调消息，右键菜单会完全没反应
     let hwnd = CreateWindowExW(
         0,
         class_name.as_ptr(),
@@ -66,7 +70,7 @@ unsafe fn run() {
         0,
         0,
         0,
-        HWND_MESSAGE as *mut _,
+        std::ptr::null_mut(),
         std::ptr::null_mut(),
         hinstance,
         std::ptr::null_mut(),
@@ -138,7 +142,7 @@ unsafe extern "system" fn tray_wndproc(
                     if !hmenu.is_null() {
                         let title: Vec<u16> = "显示主窗口\0".encode_utf16().collect();
                         let pause: Vec<u16> = "暂停 / 恢复监听\0".encode_utf16().collect();
-                        let quit: Vec<u16> = "退出 GestureCraft\0".encode_utf16().collect();
+                        let quit: Vec<u16> = "关闭 GestureCraft\0".encode_utf16().collect();
                         AppendMenuW(hmenu, 0, 1, title.as_ptr());
                         AppendMenuW(hmenu, 0, 2, pause.as_ptr());
                         AppendMenuW(hmenu, 0x800, 0, std::ptr::null()); // MF_SEPARATOR

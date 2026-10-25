@@ -10,9 +10,9 @@ pub fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
 }
 
 /// 前台窗口上下文：(进程名小写无 .exe，是否桌面/公共区域)。
-/// under_cursor=false 按活动窗口（键盘焦点）；true 按鼠标所指窗口（手势终点落点）。
-/// 供作用域解析与"粘贴并转到"的浏览器判定使用。
-pub fn foreground_context(under_cursor: bool) -> (Option<String>, bool) {
+/// pt=None 按活动窗口（键盘焦点）；Some((x,y)) 按该屏幕坐标处的窗口（"鼠标所指窗口"模式，
+/// 用手势轨迹起点判定）。供作用域解析与"粘贴并转到"的浏览器判定使用。
+pub fn foreground_context(pt: Option<(i32, i32)>) -> (Option<String>, bool) {
     #[cfg(windows)]
     unsafe {
         use winapi::um::handleapi::CloseHandle;
@@ -21,15 +21,10 @@ pub fn foreground_context(under_cursor: bool) -> (Option<String>, bool) {
         use winapi::um::winbase::QueryFullProcessImageNameW;
         use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
         use winapi::um::winuser::{
-            GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
-            WindowFromPoint,
+            GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, WindowFromPoint,
         };
-        let hwnd = if under_cursor {
-            let mut pt = POINT { x: 0, y: 0 };
-            if GetCursorPos(&mut pt) == 0 {
-                return (None, false);
-            }
-            WindowFromPoint(pt)
+        let hwnd = if let Some((x, y)) = pt {
+            WindowFromPoint(POINT { x, y })
         } else {
             GetForegroundWindow()
         };
@@ -69,10 +64,35 @@ pub fn foreground_context(under_cursor: bool) -> (Option<String>, bool) {
     }
     #[cfg(not(windows))]
     {
-        let _ = under_cursor;
+        let _ = pt;
         (None, false)
     }
 }
+
+/// 在指定屏幕坐标注入一次左键单击（"鼠标所指窗口"模式：执行动作前先单击激活该窗口）
+#[cfg(windows)]
+pub fn activate_window_at(x: i32, y: i32) {
+    use winapi::ctypes::c_int;
+    use winapi::um::winuser::{
+        SendInput, SetCursorPos, INPUT, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    };
+    let mk = |flag: u32| -> INPUT {
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.type_ = INPUT_MOUSE;
+        unsafe {
+            input.u.mi_mut().dwFlags = flag;
+        }
+        input
+    };
+    unsafe {
+        SetCursorPos(x, y);
+        let mut events = [mk(MOUSEEVENTF_LEFTDOWN), mk(MOUSEEVENTF_LEFTUP)];
+        SendInput(2, events.as_mut_ptr(), std::mem::size_of::<INPUT>() as c_int);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn activate_window_at(_x: i32, _y: i32) {}
 
 pub fn execute(a: &ActionDef, logs: &Arc<Mutex<Vec<String>>>) {
     let result: Result<String, String> = match a {
@@ -117,7 +137,7 @@ const BROWSERS: [&str; 12] = [
 /// 粘贴并转到：浏览器 → 定位地址栏(Ctrl+L) → 粘贴(Ctrl+V) → 回车；
 /// 非浏览器 → 普通 Ctrl+V。
 fn paste_and_go() -> Result<String, String> {
-    let (proc_name, _) = foreground_context(false);
+    let (proc_name, _) = foreground_context(None);
     let is_browser = proc_name.as_deref().map_or(false, |p| BROWSERS.contains(&p));
     if is_browser {
         send_combo("ctrl+l")?;

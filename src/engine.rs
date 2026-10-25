@@ -10,20 +10,11 @@ pub struct Ctx {
     pub paused: Arc<AtomicBool>,
     /// UI 线程启动后填入；引擎用它请求重绘，让日志即时显示
     pub ui_ctx: Arc<OnceLock<eframe::egui::Context>>,
-    /// 全局捕获提示：(文案, 出现时刻, 手势落点屏幕坐标)，UI 悬浮层展示 ~1.6 秒
-    pub toast: Arc<Mutex<Option<(String, std::time::Instant, (i32, i32))>>>,
 }
 
 impl Ctx {
     pub fn log(&self, line: String) {
         action::push_log(&self.logs, line);
-        if let Some(c) = self.ui_ctx.get() {
-            c.request_repaint();
-        }
-    }
-
-    pub fn set_toast(&self, text: String, pos: (i32, i32)) {
-        *self.toast.lock().unwrap() = Some((text, std::time::Instant::now(), pos));
         if let Some(c) = self.ui_ctx.get() {
             c.request_repaint();
         }
@@ -77,18 +68,24 @@ fn scope_matches(gd: &GestureDef, proc_name: Option<&str>) -> bool {
         .any(|s| p.contains(s) || s.contains(p))
 }
 
-/// 在一组手势里尝试匹配并执行。命中返回 true。pos = 手势落点（提示悬浮层定位用）。
+/// 在一组手势里尝试匹配并执行。命中返回 true。
+/// under_cursor 模式：执行动作前先在轨迹起点单击激活该窗口。
 fn attempt(
     ctx: &Ctx,
     seq: &str,
     gestures: &[GestureDef],
     tolerance: u32,
-    pos: (i32, i32),
+    start: (i32, i32),
+    under_cursor: bool,
 ) -> bool {
     let (best, _) = match_gestures(seq, gestures, tolerance);
     if let Some((gd, d)) = best {
         let arrow = gesture::arrows(&gd.pattern);
-        ctx.set_toast(format!("✓ 「{}」{arrow}", gd.name), pos);
+        if under_cursor {
+            action::activate_window_at(start.0, start.1);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        crate::overlay::show_toast(format!("✓ {} {arrow}", gd.name));
         ctx.log(format!(
             "[手势] 命中「{}」{arrow}（画出 {}，容差差距 {d}）→ 执行动作",
             gd.name,
@@ -104,6 +101,7 @@ fn attempt(
 /// 钩子线程收到完整轨迹后调用（已在新线程中）。chord = 期间单击过左键。
 /// 作用域规则：能识别所画窗口的进程 → 先匹配该程序专属手势（scope 非空且进程命中），
 /// 没命中再回退全局手势；桌面/公共区域（Progman/WorkerW）直接用全局手势。
+/// "鼠标所指窗口"模式按轨迹起点判窗，命中后先单击激活该窗口再发动作。
 pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>, chord: bool) {
     if ctx.paused.load(Ordering::Relaxed) {
         return;
@@ -125,9 +123,9 @@ pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>, chord: bool) {
         return;
     }
 
-    // 手势落点：悬浮提示定位用（未知则 (0,0)，UI 会退回屏幕中央）
-    let pos = pts.last().copied().unwrap_or((0, 0));
-    let (proc_name, is_desktop) = action::foreground_context(under_cursor);
+    // 手势轨迹：起点用于"鼠标所指窗口"判窗与激活
+    let start = pts.first().copied().unwrap_or((0, 0));
+    let (proc_name, is_desktop) = action::foreground_context(if under_cursor { Some(start) } else { None });
 
     // 1) 应用专属手势（桌面/公共区域跳过）
     if !is_desktop {
@@ -136,7 +134,7 @@ pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>, chord: bool) {
             .filter(|g| !g.is_global() && scope_matches(g, proc_name.as_deref()))
             .cloned()
             .collect();
-        if attempt(ctx, &seq, &app_gestures, tolerance, pos) {
+        if attempt(ctx, &seq, &app_gestures, tolerance, start, under_cursor) {
             return;
         }
     }
@@ -144,7 +142,7 @@ pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>, chord: bool) {
     // 2) 全局手势
     let global_gestures: Vec<GestureDef> =
         gestures.iter().filter(|g| g.is_global()).cloned().collect();
-    if attempt(ctx, &seq, &global_gestures, tolerance, pos) {
+    if attempt(ctx, &seq, &global_gestures, tolerance, start, under_cursor) {
         return;
     }
 
@@ -158,7 +156,7 @@ pub fn handle_path(ctx: &Ctx, pts: Vec<(i32, i32)>, chord: bool) {
     let near = nearest
         .map(|(gd, d)| format!("最接近「{}」差 {d}", gd.name))
         .unwrap_or_else(|| "没有启用的手势".into());
-    ctx.set_toast(format!("未匹配 {}", gesture::arrows(&seq)), pos);
+    crate::overlay::show_toast(format!("✗ 未匹配 {}", gesture::arrows(&seq)));
     ctx.log(format!(
         "[手势] 未匹配：{}（作用域 {scope_desc}；{near}）",
         gesture::arrows(&seq)
