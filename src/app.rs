@@ -85,6 +85,8 @@ pub struct UiApp {
     tab: Tab,
     /// 等级页签：0=一级 1=二级 2=三级 3=弦式
     level_sel: usize,
+    /// 田字格视图里当前选中的手势方向序列（None=未选）
+    sel: Option<String>,
     /// 正在编辑的手势在 config.gestures 中的下标；None 表示新建
     edit_index: Option<usize>,
     /// 新建态显式标志（修复"新建按钮点了没反应"）
@@ -130,6 +132,7 @@ pub fn run_ui(
                 paused,
                 tab: Tab::Gestures,
                 level_sel: 0,
+                sel: None,
                 edit_index: None,
                 creating: false,
                 draft,
@@ -400,7 +403,7 @@ impl UiApp {
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("v0.5.3").small().color(NAV_TEXT_DIM));
+                    ui.label(egui::RichText::new("v0.5.4").small().color(NAV_TEXT_DIM));
                     ui.add_space(8.0);
                     let paused = self.paused.load(Ordering::Relaxed);
                     let label = if paused { "▶  恢复监听" } else { "⏸  暂停监听" };
@@ -439,7 +442,7 @@ impl UiApp {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("全局手势").strong().size(22.0).color(INK));
                 ui.label(
-                    egui::RichText::new("所有程序通用；按一级 / 二级 / 三级 / 弦式分面板，可自由改绑动作")
+                    egui::RichText::new("所有程序通用；按一级 / 二级 / 三级分面板，弦式并入一级，可自由改绑动作")
                         .small()
                         .color(MUTED),
                 );
@@ -463,9 +466,9 @@ impl UiApp {
         ui.add_space(6.0);
 
         // 等级页签
-        let counts: [usize; 4] = {
+        let counts: [usize; 3] = {
             let cfg = self.config.read().unwrap();
-            let mut c = [0usize; 4];
+            let mut c = [0usize; 3];
             for g in &cfg.gestures {
                 for (i, lv) in LEVELS.iter().enumerate() {
                     if g.level() == *lv {
@@ -485,96 +488,310 @@ impl UiApp {
                     .clicked()
                 {
                     self.level_sel = i;
+                    self.sel = None;
                 }
             }
         });
         ui.add_space(4.0);
 
-        // 手势行
+        // 手势区：田字格视图（弦式并入一级，末段以圆点 ● 表示左键单击）
+        let level = LEVELS[self.level_sel];
         let snapshot: Vec<(usize, GestureDef)> = {
             let cfg = self.config.read().unwrap();
             cfg.gestures
                 .iter()
                 .cloned()
                 .enumerate()
-                .filter(|(_, g)| g.level() == LEVELS[self.level_sel])
+                .filter(|(_, g)| g.level() == level)
                 .collect()
         };
-        if snapshot.is_empty() {
-            card(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("此面板暂无手势。点右上角「＋ 新建手势」，或到「恢复默认手势」。")
-                        .color(MUTED),
-                );
-            });
-        }
-        for (i, gd) in snapshot.iter() {
-            let i = *i;
-            let name = gd.name.clone();
-            let arrow = gesture::arrows(&gd.pattern);
-            let summary = gd.action.summary();
-            let cat = gd.category.clone();
-            let is_spare = gd.name.starts_with("三级备选");
-            let side = if gd.level() == "三级" { 62.0 } else { 54.0 };
-            let mut en = gd.enabled;
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    draw_tian(ui, side, &gd.pattern);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&name).strong().size(15.5).color(INK),
-                            );
-                            if !cat.is_empty() {
-                                cat_badge(ui, &cat);
-                            }
-                            if is_spare {
-                                badge(
-                                    ui,
-                                    "备选",
-                                    egui::Color32::from_rgb(238, 240, 246),
-                                    MUTED,
-                                );
-                            }
-                            if !gd.enabled && !is_spare {
-                                ui.label(egui::RichText::new("已停用").small().color(MUTED));
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&arrow).strong().size(15.0).color(ACCENT),
-                            );
-                            ui.label(egui::RichText::new("·").color(MUTED));
-                            ui.label(egui::RichText::new(&summary).color(MUTED));
-                        });
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("删除").clicked() {
-                            self.config.write().unwrap().gestures.remove(i);
-                            let _ = self.config.read().unwrap().save();
-                            self.status = format!("已删除: {name}");
-                            self.status_err = false;
-                        }
-                        if ui.small_button("编辑").clicked() {
-                            self.edit_index = Some(i);
-                            self.creating = false;
-                            self.draft = self.config.read().unwrap().gestures[i].clone();
-                            self.pad_points.clear();
-                        }
-                        if ui.checkbox(&mut en, "启用").changed() {
-                            self.config.write().unwrap().gestures[i].enabled = en;
-                            let _ = self.config.read().unwrap().save();
-                        }
-                    });
-                });
-            });
-            ui.add_space(6.0);
-        }
+
+        self.show_grid_view(ui, &snapshot, level);
 
         if !self.status.is_empty() {
             ui.add_space(2.0);
-            ui.label(egui::RichText::new(&self.status).small().color(GOOD));
+            ui.label(
+                egui::RichText::new(&self.status)
+                    .small()
+                    .color(if self.status_err { BAD } else { GOOD }),
+            );
         }
+    }
+
+    // ---------- 田字格视图 ----------
+
+    /// 田字格视图：一级 = 单手势大格 + 弦式格（●）；二级/三级 = 按起笔分组、
+    /// 只用上下左右；点格子选中，底部出编辑操作条。
+    fn show_grid_view(&mut self, ui: &mut egui::Ui, all: &[(usize, GestureDef)], level: &str) {
+        ui.label(
+            egui::RichText::new(
+                "点格子选中手势，底部按钮编辑 / 删除 / 启停；空白格选中后可「新建」绑定该手势",
+            )
+            .small()
+            .color(MUTED),
+        );
+        ui.add_space(6.0);
+
+        let (cell_w, cell_h) = if level == "一级" { (175.0, 56.0) } else { (150.0, 46.0) };
+        const MAIN: [char; 4] = ['8', '2', '4', '6'];
+
+        if level == "一级" {
+            // 单手势（一段方向，不含左点）
+            ui.label(
+                egui::RichText::new("单手势").strong().size(14.5).color(INK),
+            );
+            ui.add_space(2.0);
+            let singles: Vec<(usize, GestureDef)> = all
+                .iter()
+                .filter(|(_, g)| !g.pattern.contains('L'))
+                .cloned()
+                .collect();
+            self.direction_grid(ui, "", &singles, cell_w, cell_h, false, "");
+
+            ui.add_space(12.0);
+            // 弦式：方向 + 左键单击，末段显示圆点
+            ui.label(
+                egui::RichText::new("弦式 · 拖出方向后单击左键（末段圆点）")
+                    .strong()
+                    .size(14.5)
+                    .color(INK),
+            );
+            ui.add_space(2.0);
+            let chords: Vec<(usize, GestureDef)> = all
+                .iter()
+                .filter(|(_, g)| g.pattern.contains('L'))
+                .cloned()
+                .collect();
+            self.direction_grid(ui, "", &chords, cell_w, cell_h, false, "L");
+        } else {
+            // 二级 / 三级：只使用上下左右；按起笔分组，全部组合都摆出来便于绑定
+            let prefixes: Vec<String> = if level == "二级" {
+                MAIN.iter().map(|c| c.to_string()).collect()
+            } else {
+                let mut ps = Vec::new();
+                for a in MAIN {
+                    for b in MAIN {
+                        if a != b {
+                            ps.push(format!("{a}{b}"));
+                        }
+                    }
+                }
+                ps
+            };
+            ui.horizontal_wrapped(|ui| {
+                for prefix in &prefixes {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(cell_w * 3.0 + 28.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "起笔 {}",
+                                crate::gesture::arrows(prefix)
+                            ))
+                            .strong()
+                            .size(13.5)
+                            .color(INK),
+                        );
+                        self.direction_grid(ui, prefix, all, cell_w, cell_h, true, "");
+                    });
+                }
+            });
+        }
+
+        ui.add_space(10.0);
+        self.selection_bar(ui, all);
+    }
+
+    /// 一张 3×3 可点选方向格。prefix = 已固定的前段；suffix = ""（普通）或 "L"（弦式）；
+    /// main_only = 只摆上下左右四个格子（二/三级不用斜向）。
+    fn direction_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        prefix: &str,
+        all: &[(usize, GestureDef)],
+        cell_w: f32,
+        cell_h: f32,
+        main_only: bool,
+        suffix: &str,
+    ) {
+        const DIRS: [(char, usize, usize); 8] = [
+            ('7', 0, 0),
+            ('8', 0, 1),
+            ('9', 0, 2),
+            ('4', 1, 0),
+            ('6', 1, 2),
+            ('1', 2, 0),
+            ('2', 2, 1),
+            ('3', 2, 2),
+        ];
+        let grid_id = (
+            "dirgrid",
+            ui.id(),
+            egui::Id::new(prefix),
+            egui::Id::new(suffix),
+        );
+        egui::Grid::new(grid_id).spacing([6.0, 6.0]).show(ui, |ui| {
+            for row in 0..3usize {
+                for col in 0..3usize {
+                    if (row, col) == (1, 1) {
+                        // 中心：一级显示"起手"，分组格显示起笔箭头
+                        let center = if prefix.is_empty() {
+                            "起手".to_string()
+                        } else {
+                            crate::gesture::arrows(prefix)
+                        };
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(240, 244, 251))
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(10.0, 0.0))
+                            .show(ui, |ui| {
+                                ui.set_min_size(egui::vec2(cell_w - 20.0, cell_h));
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&center)
+                                            .strong()
+                                            .size(17.0)
+                                            .color(ACCENT),
+                                    );
+                                });
+                            });
+                        continue;
+                    }
+                    let Some(&(dir, _, _)) =
+                        DIRS.iter().find(|(_, r, c)| (*r, *c) == (row, col))
+                    else {
+                        if main_only {
+                            ui.label("");
+                        }
+                        continue;
+                    };
+                    let cand = format!("{prefix}{dir}{suffix}");
+                    // 显示用箭头串：弦式末段显示圆点
+                    let arrow = if suffix == "L" {
+                        format!("{}●", crate::gesture::arrow_for(dir))
+                    } else {
+                        crate::gesture::arrows(&cand)
+                    };
+                    let found = all.iter().find(|(_, g)| g.pattern == cand);
+                    let selected = self.sel.as_deref() == Some(cand.as_str());
+                    let btn = match found {
+                        Some((_, g)) => {
+                            let disp: String = if g.name.starts_with("三级备选") {
+                                "备选".to_string()
+                            } else {
+                                g.name.chars().take(9).collect()
+                            };
+                            let mut t =
+                                egui::RichText::new(format!("{arrow} {disp}")).size(13.0);
+                            if selected {
+                                t = t.strong().color(egui::Color32::from_rgb(20, 70, 150));
+                            } else if g.enabled {
+                                t = t.color(INK);
+                            } else {
+                                t = t.color(MUTED);
+                            }
+                            egui::Button::new(t)
+                                .min_size(egui::vec2(cell_w, cell_h))
+                                .rounding(egui::Rounding::same(6.0))
+                                .fill(if selected {
+                                    egui::Color32::from_rgb(219, 233, 250)
+                                } else {
+                                    CARD_BG
+                                })
+                                .stroke(egui::Stroke::new(
+                                    if selected { 1.5_f32 } else { 1.0_f32 },
+                                    if selected {
+                                        ACCENT
+                                    } else {
+                                        egui::Color32::from_rgb(214, 220, 232)
+                                    },
+                                ))
+                        }
+                        None => {
+                            let t = egui::RichText::new(format!("{arrow} ＋"))
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(170, 180, 200));
+                            egui::Button::new(t)
+                                .min_size(egui::vec2(cell_w, cell_h))
+                                .rounding(egui::Rounding::same(6.0))
+                                .fill(egui::Color32::from_rgb(248, 250, 253))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgb(228, 233, 242),
+                                ))
+                        }
+                    };
+                    if ui.add(btn).clicked() {
+                        self.sel = Some(cand.clone());
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    }
+
+    /// 选中格下方的操作条：编辑 / 删除 / 启用开关，未绑定时出「新建」。
+    fn selection_bar(&mut self, ui: &mut egui::Ui, all: &[(usize, GestureDef)]) {
+        ui.horizontal(|ui| {
+            let Some(pat) = self.sel.clone() else {
+                ui.label(
+                    egui::RichText::new("点上方格子选中一个手势")
+                        .small()
+                        .color(MUTED),
+                );
+                return;
+            };
+            ui.label(
+                egui::RichText::new(format!("已选 {}", crate::gesture::arrows(&pat)))
+                    .strong()
+                    .color(ACCENT),
+            );
+            let found = all.iter().find(|(_, g)| g.pattern == pat);
+            match found {
+                Some((idx, g)) => {
+                    ui.label(egui::RichText::new(&g.name).color(INK));
+                    if !g.category.is_empty() {
+                        cat_badge(ui, &g.category);
+                    }
+                    ui.label(
+                        egui::RichText::new(g.action.summary()).small().color(MUTED),
+                    );
+                    if !g.enabled {
+                        badge(ui, "已停用", egui::Color32::from_rgb(238, 240, 246), MUTED);
+                    }
+                    let idx = *idx;
+                    if ui.small_button("编辑").clicked() {
+                        self.edit_index = Some(idx);
+                        self.creating = false;
+                        self.draft = self.config.read().unwrap().gestures[idx].clone();
+                        self.pad_points.clear();
+                    }
+                    if ui.small_button("删除").clicked() {
+                        let name = self.config.read().unwrap().gestures[idx].name.clone();
+                        self.config.write().unwrap().gestures.remove(idx);
+                        let _ = self.config.read().unwrap().save();
+                        self.status = format!("已删除: {name}");
+                        self.status_err = false;
+                        self.sel = None;
+                    }
+                    let mut en = g.enabled;
+                    if ui.checkbox(&mut en, "启用").changed() {
+                        self.config.write().unwrap().gestures[idx].enabled = en;
+                        let _ = self.config.read().unwrap().save();
+                    }
+                }
+                None => {
+                    ui.label(egui::RichText::new("未绑定").color(MUTED));
+                    if ui.add(primary_button("新建手势")).clicked() {
+                        let mut d = default_draft();
+                        d.pattern = pat;
+                        self.draft = d;
+                        self.edit_index = None;
+                        self.creating = true;
+                        self.pad_points.clear();
+                    }
+                }
+            }
+        });
     }
 
     fn show_editor_window(&mut self, ctx: &egui::Context) {
@@ -1067,12 +1284,14 @@ impl UiApp {
         ui.add_space(4.0);
         card(ui, |ui| {
             ui.label(
-                egui::RichText::new("GestureCraft v0.5.3").strong().size(20.0).color(ACCENT),
+                egui::RichText::new("GestureCraft v0.5.4").strong().size(20.0).color(ACCENT),
             );
             ui.label(egui::RichText::new("原创 Rust 实现的 Windows 全局鼠标手势工具。").color(INK));
             ui.add_space(6.0);
             for line in [
-                "· 一级 8 个单方向手势 + 弦式 2 个（方向+左键单击），斜向只作单手势",
+                "· 一级 8 单手势 + 弦式 8（方向+左点，末段圆点），斜向只作单手势",
+                "· 二级 12 种、三级 36 种只使用上下左右，按起笔分田字格展示",
+                "· 田字格点选式面板：格子即手势，点选后底部编辑/删除/启停",
                 "· 二级 12 种两段联动全用满（镜像成对，全部单快捷键零参数）",
                 "· 三级 36 种三段联动全量列出，默认绑 16 条、备选 20 条，可自由改绑",
                 "· 互切合并：最大化⇄还原、左/右贴边⇄还原、置顶、静音、显示桌面都是同一手势来回切",

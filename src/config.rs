@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// 右侧面板的等级页签。等级由 pattern 段数推导（弦式含 'L'）。
-pub const LEVELS: [&str; 4] = ["一级", "二级", "三级", "弦式"];
+/// 右侧面板的等级页签。等级由 pattern 段数推导；弦式（含 'L'）并入一级。
+pub const LEVELS: [&str; 3] = ["一级", "二级", "三级"];
 
 /// 手势等级归类（面板筛选用）
 pub fn level_of(pattern: &str) -> &'static str {
     if pattern.contains('L') {
-        return "弦式";
+        // 弦式（方向+左键单击）归入一级面板
+        return "一级";
     }
     match pattern.chars().count() {
         1 => "一级",
@@ -204,8 +205,8 @@ fn g(category: &str, name: &str, pattern: &str, enabled: bool, action: ActionDef
 }
 
 /// v0.5 默认手势表（用户已确认的分配方案）。
-/// 一级 8（斜向只作单手势）+ 弦式 2 + 二级 12（上下左右两段全用满，镜像成对，
-/// 全部单快捷键零参数）+ 三级 16 启用 + 20 备选（相邻段不重复的 36 种全量）。
+/// 一级 8 单手势 + 弦式 8（并入一级，方向+左点）+ 二级 12（上下左右两段全用满，
+/// 镜像成对，全部单快捷键零参数）+ 三级 16 启用 + 20 备选（上下左右三段 36 种全量）。
 pub fn default_gestures() -> Vec<GestureDef> {
     use ActionDef::*;
     let mut v = Vec::new();
@@ -220,9 +221,15 @@ pub fn default_gestures() -> Vec<GestureDef> {
     v.push(g("编辑", "撤销", "7", true, Hotkey { combo: "ctrl+z".into() }));
     v.push(g("编辑", "重做", "3", true, Hotkey { combo: "ctrl+y".into() }));
 
-    // ---------- 弦式：方向 + 左键单击 ----------
-    v.push(g("编辑", "剪切（弦式 ↑+左点）", "8L", true, Hotkey { combo: "ctrl+x".into() }));
-    v.push(g("编辑", "粘贴并回车（弦式 ↓+左点）", "2L", true, PasteAndGo));
+    // ---------- 弦式：方向 + 左键单击（并入一级面板，共 8 个全方向） ----------
+    v.push(g("编辑", "剪切", "8L", true, Hotkey { combo: "ctrl+x".into() }));
+    v.push(g("编辑", "粘贴并回车", "2L", true, PasteAndGo));
+    v.push(g("导航", "后退", "4L", true, Browser { op: "back".into() }));
+    v.push(g("导航", "前进", "6L", true, Browser { op: "forward".into() }));
+    v.push(g("导航", "放大", "9L", true, Hotkey { combo: "ctrl+=".into() }));
+    v.push(g("导航", "缩小", "1L", true, Hotkey { combo: "ctrl+-".into() }));
+    v.push(g("导航", "重置缩放", "7L", true, Hotkey { combo: "ctrl+0".into() }));
+    v.push(g("导航", "全屏切换", "3L", true, Hotkey { combo: "f11".into() }));
 
     // ---------- 二级：上下左右两段 12 种全用满，镜像成对 ----------
     v.push(g("导航", "切换左侧标签页", "87", true, Hotkey { combo: "ctrl+shift+tab".into() }));
