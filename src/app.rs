@@ -1,10 +1,11 @@
 use crate::action;
 use crate::config::{
-    browser_op_label, default_gestures, system_op_label, window_op_label, ActionDef, Config,
-    GestureDef, MouseButton, CATEGORIES, LEVELS,
+    browser_op_label, default_gestures, office_presets, system_op_label, window_op_label,
+    ActionDef, Config, GestureDef, MouseButton, TargetMode, CATEGORIES, LEVELS,
 };
 use crate::engine;
 use crate::gesture;
+use crate::tray;
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -102,10 +103,10 @@ pub struct UiApp {
     test_points: Vec<egui::Vec2>,
     test_result: Option<Result<String, String>>,
     status: String,
-    /// 保存时检测到的重复项（非空时需用户点「仍然保存」二次确认）
-    pending_conflicts: Vec<String>,
-    /// 全局捕获提示（与引擎共享，显示 ~1.2 秒）
-    toast: Arc<Mutex<Option<(String, std::time::Instant)>>>,
+    /// 全局捕获提示（与引擎共享，悬浮层展示 ~1.6 秒）
+    toast: Arc<Mutex<Option<(String, std::time::Instant, (i32, i32))>>>,
+    /// 托盘菜单命令
+    tray_rx: std::sync::mpsc::Receiver<tray::TrayCmd>,
 }
 
 pub fn run_ui(
@@ -113,7 +114,8 @@ pub fn run_ui(
     logs: Arc<Mutex<Vec<String>>>,
     paused: Arc<AtomicBool>,
     ui_ctx: Arc<std::sync::OnceLock<egui::Context>>,
-    toast: Arc<Mutex<Option<(String, std::time::Instant)>>>,
+    toast: Arc<Mutex<Option<(String, std::time::Instant, (i32, i32))>>>,
+    tray_rx: std::sync::mpsc::Receiver<tray::TrayCmd>,
 ) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -147,8 +149,8 @@ pub fn run_ui(
                 test_points: Vec::new(),
                 test_result: None,
                 status: String::new(),
-                pending_conflicts: Vec::new(),
                 toast,
+                tray_rx,
             })
         }),
     );
@@ -222,27 +224,18 @@ fn dashed_line(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, color: egui::Col
     }
 }
 
-/// 米字格 + 中心起笔的方向折线；每个转折点带序号圆点，弦式的左键单击画 "L" 点。
+/// 米字格手势图示：淡色底纹 + 中心起笔的连贯线条；
+/// 相邻两段反向（轨迹重叠）时以 U 型小弯错开，弦式左键单击画空心小圈。
 fn draw_tian(ui: &mut egui::Ui, side: f32, pattern: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
     let p = ui.painter_at(rect);
-    let grid = egui::Color32::from_rgb(196, 204, 220);
-    let diag = egui::Color32::from_rgb(216, 222, 234);
-    p.rect_filled(rect, 5.0, egui::Color32::WHITE);
-    p.rect_stroke(rect, 5.0, (0.5, egui::Color32::from_rgb(158, 166, 184)));
+    p.rect_filled(rect, 5.0, egui::Color32::from_rgb(240, 244, 251));
+    p.rect_stroke(rect, 5.0, (0.5, egui::Color32::from_rgb(150, 160, 182)));
+    let grid = egui::Color32::from_rgb(176, 186, 206);
+    let diag = egui::Color32::from_rgb(206, 213, 228);
     let c = rect.center();
-    dashed_line(
-        &p,
-        egui::pos2(rect.left() + 3.0, c.y),
-        egui::pos2(rect.right() - 3.0, c.y),
-        grid,
-    );
-    dashed_line(
-        &p,
-        egui::pos2(c.x, rect.top() + 3.0),
-        egui::pos2(c.x, rect.bottom() - 3.0),
-        grid,
-    );
+    dashed_line(&p, egui::pos2(rect.left() + 3.0, c.y), egui::pos2(rect.right() - 3.0, c.y), grid);
+    dashed_line(&p, egui::pos2(c.x, rect.top() + 3.0), egui::pos2(c.x, rect.bottom() - 3.0), grid);
     dashed_line(
         &p,
         egui::pos2(rect.left() + 5.0, rect.top() + 5.0),
@@ -264,45 +257,68 @@ fn draw_tian(ui: &mut egui::Ui, side: f32, pattern: &str) {
     let unit = match segs {
         1 => side * 0.30,
         2 => side * 0.27,
-        _ => side * 0.25,
+        _ => side * 0.24,
     };
-    let mut pt = c;
+    let off = unit * 0.26; // U 型弯的侧移量
+    let mut pos = c;
     let mut pts = vec![c];
-    let mut chord_pos = None;
+    let mut prev: Option<(f32, f32)> = None;
+    let mut chord_at = None;
     for ch in pattern.chars() {
         if ch == 'L' {
-            chord_pos = Some(egui::pos2(pt.x + unit * 0.45, pt.y - unit * 0.45));
+            chord_at = Some(egui::pos2(pos.x + unit * 0.42, pos.y - unit * 0.42));
             continue;
         }
-        let (ux, uy) = gesture::axis_of(ch);
-        pt = egui::pos2(pt.x + ux * unit, pt.y + uy * unit);
-        pts.push(pt);
+        let a = gesture::axis_of(ch);
+        if let Some(pa) = prev {
+            if pa.0 * a.0 + pa.1 * a.1 < -0.5 {
+                // 反向：垂直侧移 → 沿新方向 → 回中，形成 U 型拐弯
+                let (px, py) = (a.1, -a.0);
+                pts.push(egui::pos2(pos.x + px * off, pos.y + py * off));
+                pts.push(egui::pos2(pos.x + a.0 * unit + px * off, pos.y + a.1 * unit + py * off));
+                pos = egui::pos2(pos.x + a.0 * unit, pos.y + a.1 * unit);
+                pts.push(pos);
+                prev = Some(a);
+                continue;
+            }
+        }
+        pos = egui::pos2(pos.x + a.0 * unit, pos.y + a.1 * unit);
+        pts.push(pos);
+        prev = Some(a);
     }
-    p.add(egui::Shape::line(pts.clone(), egui::Stroke::new(2.5_f32, ACCENT)));
-    for (i, &v) in pts.iter().enumerate().skip(1) {
-        p.circle_filled(v, 6.5, ACCENT);
-        p.text(
-            v,
-            egui::Align2::CENTER_CENTER,
-            i.to_string(),
-            egui::FontId::monospace(9.0),
-            egui::Color32::WHITE,
-        );
-    }
-    if let Some(cp) = chord_pos {
-        p.circle_filled(cp, 7.0, ACCENT_DEEP);
-        p.text(
-            cp,
-            egui::Align2::CENTER_CENTER,
-            "L",
-            egui::FontId::monospace(8.0),
-            egui::Color32::WHITE,
-        );
+    p.add(egui::Shape::line(pts.clone(), egui::Stroke::new(3.0_f32, ACCENT)));
+    // 起笔点
+    p.circle_filled(pts[0], 3.0, ACCENT_DEEP);
+    if let Some(cp) = chord_at {
+        p.circle_stroke(cp, 4.5, (2.0, ACCENT_DEEP));
     }
 }
 
 impl eframe::App for UiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 托盘菜单命令
+        while let Ok(cmd) = self.tray_rx.try_recv() {
+            match cmd {
+                tray::TrayCmd::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayCmd::TogglePause => {
+                    let p = self.paused.load(Ordering::Relaxed);
+                    self.paused.store(!p, Ordering::Relaxed);
+                }
+                tray::TrayCmd::Quit => {
+                    tray::shutdown();
+                    std::process::exit(0);
+                }
+            }
+        }
+        // 点关闭 = 隐藏到托盘，不退出
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         self.show_nav(ctx);
 
         // 底部日志面板必须先于 CentralPanel 添加，否则被挤成零高度不可见
@@ -336,11 +352,7 @@ impl eframe::App for UiApp {
                 .resizable(false)
                 .frame(egui::Frame::none().fill(PAGE_BG).inner_margin(egui::Margin::same(0.0)))
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        egui::Frame::none()
-                            .outer_margin(egui::Margin::same(0.0))
-                            .show(ui, |ui| self.show_scope_col(ui));
-                    });
+                    egui::ScrollArea::vertical().show(ui, |ui| self.show_scope_col(ui));
                 });
         }
 
@@ -354,8 +366,13 @@ impl eframe::App for UiApp {
                 });
             });
 
+        // 编辑器弹窗（不再内嵌在页面底部）
+        if self.edit_index.is_some() || self.creating {
+            self.show_editor_window(ctx);
+        }
+
         self.show_add_program_dialog(ctx);
-        self.show_toast(ctx);
+        self.show_overlay(ctx);
     }
 }
 
@@ -408,7 +425,7 @@ impl UiApp {
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("v0.5.0").small().color(NAV_TEXT_DIM));
+                    ui.label(egui::RichText::new("v0.5.1").small().color(NAV_TEXT_DIM));
                     ui.add_space(8.0);
                     let paused = self.paused.load(Ordering::Relaxed);
                     let label = if paused { "▶  恢复监听" } else { "⏸  暂停监听" };
@@ -438,12 +455,30 @@ impl UiApp {
             });
     }
 
-    fn show_toast(&mut self, ctx: &egui::Context) {
-        let toast_active = {
+    fn screen_size() -> (f32, f32) {
+        #[cfg(windows)]
+        unsafe {
+            use winapi::um::winuser::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+            (
+                GetSystemMetrics(SM_CXSCREEN) as f32,
+                GetSystemMetrics(SM_CYSCREEN) as f32,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            (1920.0, 1080.0)
+        }
+    }
+
+    /// 全屏悬浮提示：独立置顶窗口（主窗口隐藏到托盘时也可见），
+    /// 跟随手势落点，固定显示 1.6 秒，末段淡出。
+    fn show_overlay(&mut self, ctx: &egui::Context) {
+        const OVERLAY_MS: u128 = 1600;
+        let msg = {
             let mut t = self.toast.lock().unwrap();
             match t.as_ref() {
-                Some((_, t0)) if t0.elapsed() < std::time::Duration::from_millis(1200) => {
-                    Some(t0.elapsed())
+                Some((s, t0, p)) if t0.elapsed().as_millis() < OVERLAY_MS => {
+                    Some((s.clone(), t0.elapsed().as_millis(), *p))
                 }
                 Some(_) => {
                     *t = None;
@@ -452,34 +487,64 @@ impl UiApp {
                 None => None,
             }
         };
-        if let Some(elapsed) = toast_active {
-            let text = self.toast.lock().unwrap().as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
-            egui::Area::new(egui::Id::new("capture_toast"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::CENTER_TOP, [0.0, 40.0])
-                .show(ctx, |ui| {
-                    let alpha = if elapsed.as_millis() > 900 { 0.45 } else { 1.0 };
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgba_unmultiplied(23, 32, 54, (alpha * 255.0) as u8))
-                        .rounding(egui::Rounding::same(12.0))
-                        .inner_margin(egui::Margin::symmetric(18.0, 10.0))
-                        .shadow(egui::epaint::Shadow {
-                            offset: egui::vec2(0.0, 3.0),
-                            blur: 16.0,
-                            spread: 0.0,
-                            color: egui::Color32::from_black_alpha(40),
-                        })
-                        .show(ui, |ui| {
+        let Some((text, elapsed, pos)) = msg else {
+            return;
+        };
+        let (sw, sh) = Self::screen_size();
+        let (w, h) = (430.0_f32, 86.0_f32);
+        let ok = text.starts_with('✓');
+        let (mut x, mut y) = if pos.0 == 0 && pos.1 == 0 {
+            (sw / 2.0 - w / 2.0, sh * 0.40 - h / 2.0)
+        } else {
+            (pos.0 as f32 - w / 2.0, pos.1 as f32 - h - 34.0)
+        };
+        x = x.clamp(8.0, (sw - w - 8.0).max(8.0));
+        y = y.clamp(8.0, (sh - h - 8.0).max(8.0));
+        let alpha: f32 = if elapsed > 1300 { 0.45 } else { 1.0 };
+        let a8 = (alpha * 240.0) as u8;
+        let (fill, edge) = if ok {
+            (
+                egui::Color32::from_rgba_unmultiplied(14, 58, 30, a8),
+                egui::Color32::from_rgba_unmultiplied(70, 190, 110, a8),
+            )
+        } else {
+            (
+                egui::Color32::from_rgba_unmultiplied(76, 20, 20, a8),
+                egui::Color32::from_rgba_unmultiplied(230, 110, 110, a8),
+            )
+        };
+        ctx.show_viewport_immediate(
+            egui::ViewportId(egui::Id::new("gc_overlay")),
+            egui::ViewportBuilder::default()
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_always_on_top()
+                .with_mouse_passthrough(true)
+                .with_position(egui::pos2(x, y))
+                .with_inner_size([w, h]),
+            move |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(fill)
+                            .rounding(egui::Rounding::same(16.0))
+                            .stroke(egui::Stroke::new(2.0_f32, edge))
+                            .inner_margin(egui::Margin::same(12.0)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.set_min_size(egui::vec2(w - 24.0, h - 24.0));
+                        ui.centered_and_justified(|ui| {
                             ui.label(
-                                egui::RichText::new(text)
+                                egui::RichText::new(&text)
                                     .strong()
-                                    .size(16.0)
+                                    .size(20.0)
                                     .color(egui::Color32::WHITE),
                             );
                         });
-                });
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
+                    });
+            },
+        );
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     // ---------- 作用域双栏 ----------
@@ -506,6 +571,7 @@ impl UiApp {
         });
         ui.add_space(6.0);
 
+        // 全局
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             let sel = self.scope_sel == GLOBAL_KEY;
@@ -514,56 +580,50 @@ impl UiApp {
             } else {
                 INK
             });
-            let label = egui::SelectableLabel::new(sel, text);
-            if ui.add_sized([ui.available_width() - 16.0, 32.0], label).clicked() {
+            if ui
+                .add_sized([ui.available_width() - 16.0, 32.0], egui::SelectableLabel::new(sel, text))
+                .clicked()
+            {
                 self.scope_sel = GLOBAL_KEY.to_string();
             }
         });
         ui.add_space(8.0);
 
+        // 程序（全部平级，无层级）
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             ui.label(egui::RichText::new("程序").small().strong().color(MUTED));
         });
         ui.add_space(4.0);
-
         let programs: Vec<String> = {
             let cfg = self.config.read().unwrap();
             cfg.programs.clone()
         };
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.vertical(|ui| {
-                ui.set_min_width(ui.available_width());
-                for key in &programs {
-                    let sel = self.scope_sel == *key;
-                    let disp = Self::program_display(key);
-                    ui.horizontal(|ui| {
-                        let text = egui::RichText::new(format!("🗔  {disp}"))
-                            .size(13.5)
-                            .color(if sel { egui::Color32::WHITE } else { INK });
-                        if ui
-                            .add_sized(
-                                [ui.available_width() - 26.0, 28.0],
-                                egui::SelectableLabel::new(sel, text),
-                            )
-                            .clicked()
-                        {
-                            self.scope_sel = key.clone();
-                        }
-                        if ui.small_button("✕").on_hover_text("移除该程序作用域").clicked() {
-                            let mut cfg = self.config.write().unwrap();
-                            cfg.programs.retain(|k| k != key);
-                            cfg.gestures.retain(|g| g.scope != *key);
-                            let _ = cfg.save();
-                            if self.scope_sel == *key {
-                                self.scope_sel = GLOBAL_KEY.to_string();
-                            }
-                        }
-                    });
+        for key in &programs {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let sel = self.scope_sel == *key;
+                let disp = Self::program_display(key);
+                let text = egui::RichText::new(format!("🗔  {disp}"))
+                    .size(13.5)
+                    .color(if sel { egui::Color32::WHITE } else { INK });
+                if ui
+                    .add_sized([ui.available_width() - 30.0, 28.0], egui::SelectableLabel::new(sel, text))
+                    .clicked()
+                {
+                    self.scope_sel = key.clone();
+                }
+                if ui.small_button("✕").on_hover_text("移除该程序作用域").clicked() {
+                    let mut cfg = self.config.write().unwrap();
+                    cfg.programs.retain(|k| k != key);
+                    cfg.gestures.retain(|g| g.scope != *key);
+                    let _ = cfg.save();
+                    if self.scope_sel == *key {
+                        self.scope_sel = GLOBAL_KEY.to_string();
+                    }
                 }
             });
-        });
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -576,7 +636,42 @@ impl UiApp {
             }
         });
 
-        ui.add_space(12.0);
+        // 捕捉目标
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("捕捉目标").strong().size(14.0).color(INK));
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                let mut mode = self.config.read().unwrap().target_mode;
+                let mut changed = false;
+                if ui
+                    .radio(mode == TargetMode::Focused, "活动窗口")
+                    .on_hover_text("手势按键盘焦点所在的程序匹配")
+                    .clicked()
+                {
+                    mode = TargetMode::Focused;
+                    changed = true;
+                }
+                if ui
+                    .radio(mode == TargetMode::UnderCursor, "鼠标所指窗口")
+                    .on_hover_text("手势按落点处鼠标所指的程序匹配")
+                    .clicked()
+                {
+                    mode = TargetMode::UnderCursor;
+                    changed = true;
+                }
+                if changed {
+                    self.config.write().unwrap().target_mode = mode;
+                    let _ = self.config.read().unwrap().save();
+                }
+            });
+        });
+
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             ui.label(
@@ -627,6 +722,14 @@ impl UiApp {
                                 if checked {
                                     if !cfg.programs.contains(key) {
                                         cfg.programs.push(key.clone());
+                                    }
+                                    // Office 三件套自动带入常用编辑手势预置
+                                    if matches!(key.as_str(), "winword" | "excel" | "powerpnt") {
+                                        for gd in office_presets(key) {
+                                            if !cfg.gestures.iter().any(|g| g.name == gd.name) {
+                                                cfg.gestures.push(gd);
+                                            }
+                                        }
                                     }
                                 } else {
                                     cfg.programs.retain(|k| k != key);
@@ -726,7 +829,7 @@ impl UiApp {
         });
         ui.add_space(4.0);
 
-        // 手势行
+        // 手势行（同时算出重复项，行上给提示徽章）
         let snapshot: Vec<(usize, GestureDef)> = {
             let cfg = self.config.read().unwrap();
             cfg.gestures
@@ -737,6 +840,24 @@ impl UiApp {
                 .filter(|(_, g)| g.level() == LEVELS[self.level_sel])
                 .collect()
         };
+        let mut dup_pattern = vec![false; snapshot.len()];
+        let mut dup_action = vec![false; snapshot.len()];
+        for a in 0..snapshot.len() {
+            for b in (a + 1)..snapshot.len() {
+                let (_, ga) = &snapshot[a];
+                let (_, gb) = &snapshot[b];
+                if ga.enabled && gb.enabled {
+                    if ga.pattern == gb.pattern {
+                        dup_pattern[a] = true;
+                        dup_pattern[b] = true;
+                    }
+                    if ga.action == gb.action {
+                        dup_action[a] = true;
+                        dup_action[b] = true;
+                    }
+                }
+            }
+        }
         if snapshot.is_empty() {
             card(ui, |ui| {
                 ui.label(
@@ -745,7 +866,8 @@ impl UiApp {
                 );
             });
         }
-        for (i, gd) in snapshot {
+        for (row, (i, gd)) in snapshot.iter().enumerate() {
+            let i = *i;
             let name = gd.name.clone();
             let arrow = gesture::arrows(&gd.pattern);
             let summary = gd.action.summary();
@@ -770,6 +892,22 @@ impl UiApp {
                                     "备选",
                                     egui::Color32::from_rgb(238, 240, 246),
                                     MUTED,
+                                );
+                            }
+                            if dup_pattern[row] {
+                                badge(
+                                    ui,
+                                    "手势重复",
+                                    egui::Color32::from_rgb(252, 232, 230),
+                                    egui::Color32::from_rgb(178, 52, 52),
+                                );
+                            }
+                            if dup_action[row] {
+                                badge(
+                                    ui,
+                                    "动作重复",
+                                    egui::Color32::from_rgb(255, 244, 224),
+                                    egui::Color32::from_rgb(178, 116, 20),
                                 );
                             }
                             if !gd.enabled && !is_spare {
@@ -810,18 +948,30 @@ impl UiApp {
             ui.add_space(2.0);
             ui.label(egui::RichText::new(&self.status).small().color(GOOD));
         }
+    }
 
-        // ---------- 编辑器 ----------
-        if self.edit_index.is_some() || self.creating {
-            ui.add_space(10.0);
-            self.show_editor(ui);
+    fn show_editor_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("编辑手势")
+            .open(&mut open)
+            .default_width(640.0)
+            .default_height(620.0)
+            .vscroll(true)
+            .show(ctx, |ui| {
+                self.editor_body(ui);
+            });
+        if !open {
+            // 右上角 × 关闭 = 取消
+            self.edit_index = None;
+            self.creating = false;
+            self.draft = default_draft();
+            self.pad_points.clear();
         }
     }
 
-    fn show_editor(&mut self, ui: &mut egui::Ui) {
-        let title = if self.creating { "新建手势" } else { "编辑手势" };
-        card(ui, |ui| {
-            ui.label(egui::RichText::new(title).strong().size(16.0).color(INK));
+    fn editor_body(&mut self, ui: &mut egui::Ui) {
+        {
+            ui.label(egui::RichText::new("名称、分类、作用域与动作；方向序列点九宫格快录或手绘板拖画").small().color(MUTED));
             ui.add_space(2.0);
 
             egui::Grid::new("editor")
@@ -1069,47 +1219,13 @@ impl UiApp {
             }
 
             ui.add_space(6.0);
-            // 保存前冲突提示：允许重复，但需二次确认
-            if !self.pending_conflicts.is_empty() {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(255, 247, 230))
-                    .rounding(egui::Rounding::same(8.0))
-                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(230, 180, 90)))
-                    .inner_margin(egui::Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("⚠ 检测到以下重复设置（允许保存，请确认）：")
-                                .strong()
-                                .color(egui::Color32::from_rgb(150, 96, 10)),
-                        );
-                        for w in &self.pending_conflicts {
-                            ui.label(egui::RichText::new(format!("· {w}")).color(egui::Color32::from_rgb(150, 96, 10)));
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.small_button("返回修改").clicked() {
-                                self.pending_conflicts.clear();
-                            }
-                            ui.label(
-                                egui::RichText::new("确认无误就再点一次「仍然保存」")
-                                    .small()
-                                    .color(MUTED),
-                            );
-                        });
-                    });
-                ui.add_space(4.0);
-            }
             ui.horizontal(|ui| {
-                let save_label = if self.pending_conflicts.is_empty() { "保存" } else { "仍然保存" };
                 if ui
                     .add(
                         egui::Button::new(
-                            egui::RichText::new(save_label).strong().color(egui::Color32::WHITE),
+                            egui::RichText::new("确定").strong().color(egui::Color32::WHITE),
                         )
-                        .fill(if self.pending_conflicts.is_empty() {
-                            ACCENT
-                        } else {
-                            egui::Color32::from_rgb(216, 138, 26)
-                        })
+                        .fill(ACCENT)
                         .rounding(egui::Rounding::same(8.0))
                         .min_size(egui::vec2(90.0, 32.0)),
                     )
@@ -1119,20 +1235,16 @@ impl UiApp {
                         self.status = "方向序列不能为空".into();
                     } else if self.draft.name.trim().is_empty() {
                         self.status = "名称不能为空".into();
-                    } else if self.pending_conflicts.is_empty() {
-                        // 第一次点：查重并展示提示（有重复则不落盘）
+                    } else {
+                        // 一次点击直接保存；重复项写进状态区提示（面板行上也有徽章）
                         let conflicts = {
                             let cfg = self.config.read().unwrap();
                             cfg.conflict_warnings(&self.draft.clone(), self.edit_index)
                         };
-                        if conflicts.is_empty() {
-                            self.save_draft();
-                        } else {
-                            self.pending_conflicts = conflicts;
-                        }
-                    } else {
-                        // 第二次点：用户已确认，允许重复保存
                         self.save_draft();
+                        if !conflicts.is_empty() {
+                            self.status = format!("已保存；注意重复：{}", conflicts.join("；"));
+                        }
                     }
                 }
                 if ui
@@ -1147,10 +1259,9 @@ impl UiApp {
                     self.creating = false;
                     self.draft = default_draft();
                     self.pad_points.clear();
-                    self.pending_conflicts.clear();
                 }
             });
-        });
+        }
     }
 
     /// 把 draft 写入配置并复位编辑器状态
@@ -1166,7 +1277,6 @@ impl UiApp {
         self.creating = false;
         self.draft = default_draft();
         self.pad_points.clear();
-        self.pending_conflicts.clear();
         self.status = "已保存".into();
     }
 
@@ -1332,7 +1442,7 @@ impl UiApp {
         ui.add_space(4.0);
         card(ui, |ui| {
             ui.label(
-                egui::RichText::new("GestureCraft v0.5.0").strong().size(20.0).color(ACCENT),
+                egui::RichText::new("GestureCraft v0.5.1").strong().size(20.0).color(ACCENT),
             );
             ui.label(egui::RichText::new("原创 Rust 实现的 Windows 全局鼠标手势工具。").color(INK));
             ui.add_space(6.0);

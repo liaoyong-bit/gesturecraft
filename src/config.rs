@@ -25,6 +25,16 @@ pub enum MouseButton {
     Middle,
 }
 
+/// 捕捉目标：手势作用域按哪个窗口判定
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetMode {
+    /// 前台活动窗口（键盘焦点所在）
+    #[default]
+    Focused,
+    /// 鼠标所指窗口（手势终点落点）
+    UnderCursor,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionDef {
@@ -164,6 +174,9 @@ pub struct Config {
     /// 已添加的程序作用域（进程名关键字列表）
     #[serde(default = "default_programs")]
     pub programs: Vec<String>,
+    /// 捕捉目标：活动窗口 / 鼠标所指窗口
+    #[serde(default)]
+    pub target_mode: TargetMode,
     pub gestures: Vec<GestureDef>,
     /// 配置结构版本；<5 时用新默认表整体替换（v0.4 → v0.5 默认表大改）
     #[serde(default)]
@@ -188,6 +201,7 @@ impl Default for Config {
             turn_px: default_turn(),
             fuzzy_tolerance: default_fuzzy(),
             programs: default_programs(),
+            target_mode: TargetMode::Focused,
             gestures: default_gestures(),
             schema: 5,
         }
@@ -312,6 +326,41 @@ pub fn default_gestures() -> Vec<GestureDef> {
     v
 }
 
+/// Office 程序专属预置（按编辑快捷键使用频率排序）。
+/// 作用域内手势与全局重复属正常覆盖，不冲突。
+/// app: "winword" | "excel" | "powerpnt"
+pub fn office_presets(app: &str) -> Vec<GestureDef> {
+    use ActionDef::*;
+    let (label, scope) = match app {
+        "winword" => ("Word", "winword"),
+        "excel" => ("Excel", "excel"),
+        "powerpnt" => ("PPT", "powerpnt"),
+        _ => return Vec::new(),
+    };
+    let mut items: Vec<(&str, &str, ActionDef)> = vec![
+        ("撤销", "7", Hotkey { combo: "ctrl+z".into() }),
+        ("重做", "3", Hotkey { combo: "ctrl+y".into() }),
+        ("保存", "82", Hotkey { combo: "ctrl+s".into() }),
+        ("加粗", "8", Hotkey { combo: "ctrl+b".into() }),
+        ("斜体", "2", Hotkey { combo: "ctrl+i".into() }),
+        ("下划线", "62", Hotkey { combo: "ctrl+u".into() }),
+        ("居中", "23", Hotkey { combo: "ctrl+e".into() }),
+        ("左对齐", "21", Hotkey { combo: "ctrl+l".into() }),
+        ("右对齐", "29", Hotkey { combo: "ctrl+r".into() }),
+        ("查找", "87", Hotkey { combo: "ctrl+f".into() }),
+        ("替换", "89", Hotkey { combo: "ctrl+h".into() }),
+        ("打印", "43", Hotkey { combo: "ctrl+p".into() }),
+    ];
+    if app == "powerpnt" {
+        items.push(("幻灯片放映", "842", Hotkey { combo: "f5".into() }));
+        items.push(("从头放映（当前页）", "846", Hotkey { combo: "shift+f5".into() }));
+    }
+    items
+        .into_iter()
+        .map(|(name, pat, act)| gs("编辑", &format!("{label}·{name}"), pat, true, scope, act))
+        .collect()
+}
+
 /// 旧版 UDLR 序列 → 8 方向数字编码，并折叠相邻重复（旧版 "DD" 不可达，归一为 "2"）。
 /// 仅当模式完全由旧编码字母组成时才迁移；新式模式（含 'L' 弦式标记）原样保留。
 fn migrate_pattern(p: &str) -> String {
@@ -363,9 +412,15 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let overlap = cand_scopes.is_empty()
-                || other_scopes.is_empty()
-                || cand_scopes.iter().any(|a| other_scopes.contains(a));
+            // 程序手势覆盖全局是设计行为（程序内只执行程序设定），
+            // 一全局一程序不算冲突；只有 全局↔全局 或 程序↔同程序 才提示
+            let overlap = if cand_scopes.is_empty() {
+                other_scopes.is_empty()
+            } else if other_scopes.is_empty() {
+                false
+            } else {
+                cand_scopes.iter().any(|a| other_scopes.contains(a))
+            };
             if !overlap {
                 continue;
             }

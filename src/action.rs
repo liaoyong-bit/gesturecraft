@@ -10,16 +10,29 @@ pub fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
 }
 
 /// 前台窗口上下文：(进程名小写无 .exe，是否桌面/公共区域)。
+/// under_cursor=false 按活动窗口（键盘焦点）；true 按鼠标所指窗口（手势终点落点）。
 /// 供作用域解析与"粘贴并转到"的浏览器判定使用。
-pub fn foreground_context() -> (Option<String>, bool) {
+pub fn foreground_context(under_cursor: bool) -> (Option<String>, bool) {
     #[cfg(windows)]
     unsafe {
         use winapi::um::handleapi::CloseHandle;
         use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::shared::windef::POINT;
         use winapi::um::winbase::QueryFullProcessImageNameW;
         use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
-        use winapi::um::winuser::{GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId};
-        let hwnd = GetForegroundWindow();
+        use winapi::um::winuser::{
+            GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+            WindowFromPoint,
+        };
+        let hwnd = if under_cursor {
+            let mut pt = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut pt) == 0 {
+                return (None, false);
+            }
+            WindowFromPoint(pt)
+        } else {
+            GetForegroundWindow()
+        };
         if hwnd.is_null() {
             return (None, false);
         }
@@ -56,6 +69,7 @@ pub fn foreground_context() -> (Option<String>, bool) {
     }
     #[cfg(not(windows))]
     {
+        let _ = under_cursor;
         (None, false)
     }
 }
@@ -103,7 +117,7 @@ const BROWSERS: [&str; 12] = [
 /// 粘贴并转到：浏览器 → 定位地址栏(Ctrl+L) → 粘贴(Ctrl+V) → 回车；
 /// 非浏览器 → 普通 Ctrl+V。
 fn paste_and_go() -> Result<String, String> {
-    let (proc_name, _) = foreground_context();
+    let (proc_name, _) = foreground_context(false);
     let is_browser = proc_name.as_deref().map_or(false, |p| BROWSERS.contains(&p));
     if is_browser {
         send_combo("ctrl+l")?;
@@ -435,6 +449,7 @@ pub fn common_programs() -> Vec<(String, String)> {
         ("everything".into(), "Everything".into()),
         ("winword".into(), "Word".into()),
         ("excel".into(), "Excel".into()),
+        ("powerpnt".into(), "PowerPoint".into()),
     ]
 }
 
