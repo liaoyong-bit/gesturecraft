@@ -1,7 +1,6 @@
-use crate::action;
 use crate::config::{
-    browser_op_label, default_gestures, office_presets, system_op_label, window_op_label,
-    ActionDef, Config, GestureDef, MouseButton, TargetMode, CATEGORIES, LEVELS,
+    browser_op_label, default_gestures, system_op_label, window_op_label, ActionDef, Config,
+    GestureDef, MouseButton, TargetMode, CATEGORIES, LEVELS,
 };
 use crate::engine;
 use crate::gesture;
@@ -22,8 +21,6 @@ const INK: egui::Color32 = egui::Color32::from_rgb(35, 42, 58);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(128, 137, 155);
 const GOOD: egui::Color32 = egui::Color32::from_rgb(24, 140, 66);
 const BAD: egui::Color32 = egui::Color32::from_rgb(198, 52, 52);
-
-const GLOBAL_KEY: &str = "__global__";
 
 fn cat_color(cat: &str) -> (egui::Color32, egui::Color32) {
     match cat {
@@ -86,13 +83,8 @@ pub struct UiApp {
     logs: Arc<Mutex<Vec<String>>>,
     paused: Arc<AtomicBool>,
     tab: Tab,
-    /// 当前作用域：GLOBAL_KEY=全局，否则为进程名关键字
-    scope_sel: String,
     /// 等级页签：0=一级 1=二级 2=三级 3=弦式
     level_sel: usize,
-    /// 添加程序弹窗
-    show_add_program: bool,
-    prog_query: String,
     /// 正在编辑的手势在 config.gestures 中的下标；None 表示新建
     edit_index: Option<usize>,
     /// 新建态显式标志（修复"新建按钮点了没反应"）
@@ -103,6 +95,8 @@ pub struct UiApp {
     test_points: Vec<egui::Vec2>,
     test_result: Option<Result<String, String>>,
     status: String,
+    /// status 是否为错误文案（红色显示）
+    status_err: bool,
     /// 托盘菜单命令
     tray_rx: std::sync::mpsc::Receiver<tray::TrayCmd>,
 }
@@ -135,10 +129,7 @@ pub fn run_ui(
                 logs,
                 paused,
                 tab: Tab::Gestures,
-                scope_sel: GLOBAL_KEY.to_string(),
                 level_sel: 0,
-                show_add_program: false,
-                prog_query: String::new(),
                 edit_index: None,
                 creating: false,
                 draft,
@@ -146,6 +137,7 @@ pub fn run_ui(
                 test_points: Vec::new(),
                 test_result: None,
                 status: String::new(),
+                status_err: false,
                 tray_rx,
             })
         }),
@@ -200,7 +192,6 @@ fn default_draft() -> GestureDef {
         enabled: true,
         action: ActionDef::RunApp { path: String::new(), args: String::new() },
         category: "编辑".into(),
-        scope: String::new(),
     }
 }
 
@@ -342,17 +333,7 @@ impl eframe::App for UiApp {
                     });
             });
 
-        // 手势库页：左侧作用域双栏（全局 / 程序）
-        if self.tab == Tab::Gestures {
-            egui::SidePanel::left("scope_col")
-                .exact_width(186.0)
-                .resizable(false)
-                .frame(egui::Frame::none().fill(PAGE_BG).inner_margin(egui::Margin::same(0.0)))
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.show_scope_col(ui));
-                });
-        }
-
+        // 手势库页：左侧作用域双栏已取消（v0.5.3 全部全局），中央面板独占
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(PAGE_BG).inner_margin(egui::Margin::same(16.0)))
             .show(ctx, |ui| {
@@ -367,8 +348,6 @@ impl eframe::App for UiApp {
         if self.edit_index.is_some() || self.creating {
             self.show_editor_window(ctx);
         }
-
-        self.show_add_program_dialog(ctx);
     }
 }
 
@@ -421,7 +400,7 @@ impl UiApp {
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("v0.5.2").small().color(NAV_TEXT_DIM));
+                    ui.label(egui::RichText::new("v0.5.3").small().color(NAV_TEXT_DIM));
                     ui.add_space(8.0);
                     let paused = self.paused.load(Ordering::Relaxed);
                     let label = if paused { "▶  恢复监听" } else { "⏸  暂停监听" };
@@ -451,242 +430,32 @@ impl UiApp {
             });
     }
 
-    // ---------- 作用域双栏 ----------
-
-    fn program_display(key: &str) -> String {
-        action::candidate_programs()
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, d)| d.clone())
-            .unwrap_or_else(|| {
-                let mut c = key.chars();
-                match c.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                    None => key.to_string(),
-                }
-            })
-    }
-
-    fn show_scope_col(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("作用域").strong().size(15.0).color(INK));
-        });
-        ui.add_space(6.0);
-
-        let programs: Vec<String> = {
-            let cfg = self.config.read().unwrap();
-            cfg.programs.clone()
-        };
-
-        // 两列 Grid：名称列 / 移除按钮列，列宽由最宽行决定 → 所有行左缘严格对齐
-        egui::Grid::new("scope_grid")
-            .num_columns(2)
-            .spacing([6.0, 3.0])
-            .show(ui, |ui| {
-                // 全局
-                let sel = self.scope_sel == GLOBAL_KEY;
-                let text = egui::RichText::new("全局")
-                    .size(14.0)
-                    .color(if sel { egui::Color32::WHITE } else { INK });
-                if ui.selectable_label(sel, text).clicked() {
-                    self.scope_sel = GLOBAL_KEY.to_string();
-                }
-                ui.end_row();
-
-                // 程序（全部平级，无层级）
-                for key in &programs {
-                    let sel = self.scope_sel == *key;
-                    let disp = Self::program_display(key);
-                    let text = egui::RichText::new(disp)
-                        .size(13.5)
-                        .color(if sel { egui::Color32::WHITE } else { INK });
-                    if ui.selectable_label(sel, text).clicked() {
-                        self.scope_sel = key.clone();
-                    }
-                    if ui.small_button("×").on_hover_text("移除该程序作用域").clicked() {
-                        let mut cfg = self.config.write().unwrap();
-                        cfg.programs.retain(|k| k != key);
-                        cfg.gestures.retain(|g| g.scope != *key);
-                        let _ = cfg.save();
-                        drop(cfg);
-                        if self.scope_sel == *key {
-                            self.scope_sel = GLOBAL_KEY.to_string();
-                        }
-                    }
-                    ui.end_row();
-                }
-
-                if ui
-                    .add(egui::Button::new(egui::RichText::new("＋ 添加程序").size(13.0)))
-                    .clicked()
-                {
-                    self.show_add_program = true;
-                    self.prog_query.clear();
-                }
-                ui.end_row();
-            });
-
-        // 捕捉目标
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("捕捉目标").strong().size(14.0).color(INK));
-        });
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.vertical(|ui| {
-                let mut mode = self.config.read().unwrap().target_mode;
-                let mut changed = false;
-                if ui
-                    .radio(mode == TargetMode::Focused, "活动窗口")
-                    .on_hover_text("手势按键盘焦点所在的程序匹配")
-                    .clicked()
-                {
-                    mode = TargetMode::Focused;
-                    changed = true;
-                }
-                if ui
-                    .radio(mode == TargetMode::UnderCursor, "鼠标所指窗口")
-                    .on_hover_text("按手势起点的窗口匹配，执行动作前先单击该窗口将其激活")
-                    .clicked()
-                {
-                    mode = TargetMode::UnderCursor;
-                    changed = true;
-                }
-                if changed {
-                    self.config.write().unwrap().target_mode = mode;
-                    let _ = self.config.read().unwrap().save();
-                }
-            });
-        });
-
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.label(
-                egui::RichText::new("全局手势所有程序共用；\n程序手势仅在该程序窗口\n中优先生效，桌面直接\n走全局。")
-                    .small()
-                    .color(MUTED),
-            );
-        });
-    }
-
-    fn show_add_program_dialog(&mut self, ctx: &egui::Context) {
-        if !self.show_add_program {
-            return;
-        }
-        let mut open = self.show_add_program;
-        egui::Window::new("添加程序作用域")
-            .open(&mut open)
-            .default_width(420.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("勾选要添加的程序（含当前运行中的程序与常用程序）")
-                        .small()
-                        .color(MUTED),
-                );
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.prog_query)
-                        .hint_text("搜索…")
-                        .desired_width(ui.available_width()),
-                );
-                ui.add_space(4.0);
-                let query = self.prog_query.to_lowercase();
-                let current: Vec<String> =
-                    self.config.read().unwrap().programs.clone();
-                let cands = action::candidate_programs();
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    for (key, disp) in &cands {
-                        if !query.is_empty()
-                            && !key.contains(&query)
-                            && !disp.to_lowercase().contains(&query)
-                        {
-                            continue;
-                        }
-                        let mut checked = current.contains(key);
-                        ui.horizontal(|ui| {
-                            if ui.checkbox(&mut checked, disp).changed() {
-                                let mut cfg = self.config.write().unwrap();
-                                if checked {
-                                    if !cfg.programs.contains(key) {
-                                        cfg.programs.push(key.clone());
-                                    }
-                                    // Office 三件套自动带入常用编辑手势预置
-                                    if matches!(key.as_str(), "winword" | "excel" | "powerpnt") {
-                                        for gd in office_presets(key) {
-                                            if !cfg.gestures.iter().any(|g| g.name == gd.name) {
-                                                cfg.gestures.push(gd);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    cfg.programs.retain(|k| k != key);
-                                    cfg.gestures.retain(|g| g.scope != *key);
-                                    if self.scope_sel == *key {
-                                        self.scope_sel = GLOBAL_KEY.to_string();
-                                    }
-                                }
-                                let _ = cfg.save();
-                            }
-                            ui.label(
-                                egui::RichText::new(key.as_str()).small().color(MUTED).monospace(),
-                            );
-                        });
-                    }
-                });
-            });
-        self.show_add_program = open;
-    }
-
     // ---------- 手势库 ----------
 
-    fn scope_gesture_visible(&self, g: &GestureDef) -> bool {
-        if self.scope_sel == GLOBAL_KEY {
-            g.is_global()
-        } else {
-            g.scope
-                .to_ascii_lowercase()
-                .split(',')
-                .any(|s| s.trim() == self.scope_sel)
-        }
-    }
-
     fn show_gestures(&mut self, ui: &mut egui::Ui) {
-        let scope_title = if self.scope_sel == GLOBAL_KEY {
-            "全局手势".to_string()
-        } else {
-            format!("「{}」的专属手势", Self::program_display(&self.scope_sel))
-        };
-
         // 标题行
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(&scope_title).strong().size(22.0).color(INK));
+                ui.label(egui::RichText::new("全局手势").strong().size(22.0).color(INK));
                 ui.label(
-                    egui::RichText::new("按一级 / 二级 / 三级 / 弦式分面板；所有手势可自由改绑动作")
+                    egui::RichText::new("所有程序通用；按一级 / 二级 / 三级 / 弦式分面板，可自由改绑动作")
                         .small()
                         .color(MUTED),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("恢复默认手势").on_hover_text("用 v0.5 出厂默认表替换当前全部手势").clicked() {
+                if ui.button("恢复默认手势").on_hover_text("用出厂默认表替换当前全部手势").clicked() {
                     let mut cfg = self.config.write().unwrap();
                     cfg.gestures = default_gestures();
                     let _ = cfg.save();
                     self.status = "已恢复默认手势表".into();
+                    self.status_err = false;
                 }
                 if ui.add(primary_button("＋ 新建手势")).clicked() {
                     self.edit_index = None;
                     self.creating = true;
                     self.draft = default_draft();
-                    if self.scope_sel != GLOBAL_KEY {
-                        self.draft.scope = self.scope_sel.clone();
-                    }
                     self.pad_points.clear();
                 }
             });
@@ -697,7 +466,7 @@ impl UiApp {
         let counts: [usize; 4] = {
             let cfg = self.config.read().unwrap();
             let mut c = [0usize; 4];
-            for g in cfg.gestures.iter().filter(|g| self.scope_gesture_visible(g)) {
+            for g in &cfg.gestures {
                 for (i, lv) in LEVELS.iter().enumerate() {
                     if g.level() == *lv {
                         c[i] += 1;
@@ -721,44 +490,25 @@ impl UiApp {
         });
         ui.add_space(4.0);
 
-        // 手势行（同时算出重复项，行上给提示徽章）
+        // 手势行
         let snapshot: Vec<(usize, GestureDef)> = {
             let cfg = self.config.read().unwrap();
             cfg.gestures
                 .iter()
                 .cloned()
                 .enumerate()
-                .filter(|(_, g)| self.scope_gesture_visible(g))
                 .filter(|(_, g)| g.level() == LEVELS[self.level_sel])
                 .collect()
         };
-        let mut dup_pattern = vec![false; snapshot.len()];
-        let mut dup_action = vec![false; snapshot.len()];
-        for a in 0..snapshot.len() {
-            for b in (a + 1)..snapshot.len() {
-                let (_, ga) = &snapshot[a];
-                let (_, gb) = &snapshot[b];
-                if ga.enabled && gb.enabled {
-                    if ga.pattern == gb.pattern {
-                        dup_pattern[a] = true;
-                        dup_pattern[b] = true;
-                    }
-                    if ga.action == gb.action {
-                        dup_action[a] = true;
-                        dup_action[b] = true;
-                    }
-                }
-            }
-        }
         if snapshot.is_empty() {
             card(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("此面板暂无手势。点右上角「＋ 新建手势」（作用域已自动带上当前程序），或到「恢复默认手势」。")
+                    egui::RichText::new("此面板暂无手势。点右上角「＋ 新建手势」，或到「恢复默认手势」。")
                         .color(MUTED),
                 );
             });
         }
-        for (row, (i, gd)) in snapshot.iter().enumerate() {
+        for (i, gd) in snapshot.iter() {
             let i = *i;
             let name = gd.name.clone();
             let arrow = gesture::arrows(&gd.pattern);
@@ -786,22 +536,6 @@ impl UiApp {
                                     MUTED,
                                 );
                             }
-                            if dup_pattern[row] {
-                                badge(
-                                    ui,
-                                    "手势重复",
-                                    egui::Color32::from_rgb(252, 232, 230),
-                                    egui::Color32::from_rgb(178, 52, 52),
-                                );
-                            }
-                            if dup_action[row] {
-                                badge(
-                                    ui,
-                                    "动作重复",
-                                    egui::Color32::from_rgb(255, 244, 224),
-                                    egui::Color32::from_rgb(178, 116, 20),
-                                );
-                            }
                             if !gd.enabled && !is_spare {
                                 ui.label(egui::RichText::new("已停用").small().color(MUTED));
                             }
@@ -819,6 +553,7 @@ impl UiApp {
                             self.config.write().unwrap().gestures.remove(i);
                             let _ = self.config.read().unwrap().save();
                             self.status = format!("已删除: {name}");
+                            self.status_err = false;
                         }
                         if ui.small_button("编辑").clicked() {
                             self.edit_index = Some(i);
@@ -863,7 +598,7 @@ impl UiApp {
 
     fn editor_body(&mut self, ui: &mut egui::Ui) {
         {
-            ui.label(egui::RichText::new("名称、分类、作用域与动作；方向序列点九宫格快录或手绘板拖画").small().color(MUTED));
+            ui.label(egui::RichText::new("名称、分类与动作；方向序列点九宫格快录或手绘板拖画").small().color(MUTED));
             ui.add_space(2.0);
 
             egui::Grid::new("editor")
@@ -882,23 +617,6 @@ impl UiApp {
                                 ui.selectable_value(&mut self.draft.category, c.to_string(), c);
                             }
                         });
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("作用域").color(INK));
-                    ui.vertical(|ui| {
-                        ui.add_sized(
-                            [320.0, 24.0],
-                            egui::TextEdit::singleline(&mut self.draft.scope)
-                                .hint_text("留空=全局生效；填进程名关键字如 msedge、chrome"),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "命中该程序的窗口时优先使用本手势（可逗号分隔多个），否则走全局手势",
-                            )
-                            .small()
-                            .color(MUTED),
-                        );
-                    });
                     ui.end_row();
 
                     ui.label(egui::RichText::new("动作类型").color(INK));
@@ -1125,17 +843,21 @@ impl UiApp {
                 {
                     if self.draft.pattern.is_empty() {
                         self.status = "方向序列不能为空".into();
+                        self.status_err = true;
                     } else if self.draft.name.trim().is_empty() {
                         self.status = "名称不能为空".into();
+                        self.status_err = true;
                     } else {
-                        // 一次点击直接保存；重复项写进状态区提示（面板行上也有徽章）
+                        // 重复即报错、不允许保存（全部全局，不存在作用域覆盖）
                         let conflicts = {
                             let cfg = self.config.read().unwrap();
-                            cfg.conflict_warnings(&self.draft.clone(), self.edit_index)
+                            cfg.blocking_conflicts(&self.draft.clone(), self.edit_index)
                         };
-                        self.save_draft();
                         if !conflicts.is_empty() {
-                            self.status = format!("已保存；注意重复：{}", conflicts.join("；"));
+                            self.status = format!("未保存：{}", conflicts.join("；"));
+                            self.status_err = true;
+                        } else {
+                            self.save_draft();
                         }
                     }
                 }
@@ -1224,6 +946,17 @@ impl UiApp {
                     1 => "宽松（推荐）：允许歪 45°、多/少拐一段".to_string(),
                     _ => "最宽松：单方向手势也会近似命中，易误触".to_string(),
                 });
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("捕捉目标").color(INK));
+                let mut tm = { self.config.read().unwrap().target_mode };
+                if ui.radio(tm == TargetMode::Focused, "活动窗口").on_hover_text("动作发给键盘焦点所在的窗口").clicked() {
+                    tm = TargetMode::Focused;
+                }
+                if ui.radio(tm == TargetMode::UnderCursor, "鼠标所指窗口").on_hover_text("手势在哪个窗口上起笔就先单击激活它，再把动作发给它").clicked() {
+                    tm = TargetMode::UnderCursor;
+                }
+                self.config.write().unwrap().target_mode = tm;
             });
             if ui
                 .add(
@@ -1334,7 +1067,7 @@ impl UiApp {
         ui.add_space(4.0);
         card(ui, |ui| {
             ui.label(
-                egui::RichText::new("GestureCraft v0.5.1").strong().size(20.0).color(ACCENT),
+                egui::RichText::new("GestureCraft v0.5.3").strong().size(20.0).color(ACCENT),
             );
             ui.label(egui::RichText::new("原创 Rust 实现的 Windows 全局鼠标手势工具。").color(INK));
             ui.add_space(6.0);
@@ -1342,9 +1075,10 @@ impl UiApp {
                 "· 一级 8 个单方向手势 + 弦式 2 个（方向+左键单击），斜向只作单手势",
                 "· 二级 12 种两段联动全用满（镜像成对，全部单快捷键零参数）",
                 "· 三级 36 种三段联动全量列出，默认绑 16 条、备选 20 条，可自由改绑",
-                "· 田字格图示：米字格中心起笔，序号标注分段顺序",
-                "· 转折阈值：画 ← 手微漂不再误拆成两段，大小可调",
-                "· 作用域双栏：全局 / 程序专属手势（Edge 默认预载官方 16 手势）",
+                "· 互切合并：最大化⇄还原、左/右贴边⇄还原、置顶、静音、显示桌面都是同一手势来回切",
+                "· 全部手势全局生效；重复的手势/名称不允许保存，编辑器直接报错",
+                "· 田字格图示：米字格中心起笔连贯一笔，转折阈值防微漂误拆",
+                "· 常驻托盘，点关闭进托盘；原生悬浮提示 1 秒渐隐",
                 "· 普通右键点击不受影响（延迟触发，无菜单异常）",
             ] {
                 ui.label(egui::RichText::new(line).color(INK));

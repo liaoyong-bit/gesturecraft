@@ -9,25 +9,19 @@ pub fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
     l.push(line);
 }
 
-/// 前台窗口上下文：(进程名小写无 .exe，是否桌面/公共区域)。
-/// pt=None 按活动窗口（键盘焦点）；Some((x,y)) 按该屏幕坐标处的窗口（"鼠标所指窗口"模式，
-/// 用手势轨迹起点判定）。供作用域解析与"粘贴并转到"的浏览器判定使用。
-pub fn foreground_context(pt: Option<(i32, i32)>) -> (Option<String>, bool) {
+/// 前台（活动）窗口上下文：(进程名小写无 .exe，是否桌面/公共区域)。
+/// 供"粘贴并转到"的浏览器判定使用。
+pub fn foreground_context() -> (Option<String>, bool) {
     #[cfg(windows)]
     unsafe {
         use winapi::um::handleapi::CloseHandle;
         use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::shared::windef::POINT;
         use winapi::um::winbase::QueryFullProcessImageNameW;
         use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
         use winapi::um::winuser::{
-            GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, WindowFromPoint,
+            GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
         };
-        let hwnd = if let Some((x, y)) = pt {
-            WindowFromPoint(POINT { x, y })
-        } else {
-            GetForegroundWindow()
-        };
+        let hwnd = GetForegroundWindow();
         if hwnd.is_null() {
             return (None, false);
         }
@@ -64,7 +58,6 @@ pub fn foreground_context(pt: Option<(i32, i32)>) -> (Option<String>, bool) {
     }
     #[cfg(not(windows))]
     {
-        let _ = pt;
         (None, false)
     }
 }
@@ -137,7 +130,7 @@ const BROWSERS: [&str; 12] = [
 /// 粘贴并转到：浏览器 → 定位地址栏(Ctrl+L) → 粘贴(Ctrl+V) → 回车；
 /// 非浏览器 → 普通 Ctrl+V。
 fn paste_and_go() -> Result<String, String> {
-    let (proc_name, _) = foreground_context(None);
+    let (proc_name, _) = foreground_context();
     let is_browser = proc_name.as_deref().map_or(false, |p| BROWSERS.contains(&p));
     if is_browser {
         send_combo("ctrl+l")?;
@@ -170,10 +163,10 @@ fn window_op(op: &str) -> Result<String, String> {
         use winapi::ctypes::c_void;
         use winapi::shared::windef::RECT;
         use winapi::um::winuser::{
-            GetForegroundWindow, GetWindowLongW, PostMessageW, SetWindowPos, ShowWindow,
-            SystemParametersInfoW, GWL_EXSTYLE, HWND_TOP, HWND_NOTOPMOST, HWND_TOPMOST,
-            SPI_GETWORKAREA, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE,
-            WM_CLOSE, WS_EX_TOPMOST,
+            GetForegroundWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect, IsZoomed,
+            PostMessageW, SetWindowPos, ShowWindow, SystemParametersInfoW, GWL_EXSTYLE, HWND_TOP,
+            HWND_NOTOPMOST, HWND_TOPMOST, SPI_GETWORKAREA, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+            SWP_NOMOVE, SWP_NOSIZE, WINDOWPLACEMENT, WM_CLOSE, WS_EX_TOPMOST,
         };
         let hwnd = GetForegroundWindow();
         if hwnd.is_null() {
@@ -183,8 +176,13 @@ fn window_op(op: &str) -> Result<String, String> {
             "minimize" => {
                 ShowWindow(hwnd, SW_MINIMIZE);
             }
+            // 最大化 ⇄ 还原：同一手势，已最大化则还原，否则最大化
             "maximize" => {
-                ShowWindow(hwnd, SW_MAXIMIZE);
+                if IsZoomed(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    ShowWindow(hwnd, SW_MAXIMIZE);
+                }
             }
             "restore" => {
                 ShowWindow(hwnd, SW_RESTORE);
@@ -205,6 +203,8 @@ fn window_op(op: &str) -> Result<String, String> {
                     SWP_NOMOVE | SWP_NOSIZE,
                 );
             }
+            // 贴边 ⇄ 还原：同一手势。已贴在同一边（或最大化）时还原到贴边前的位置；
+            // 否则贴边并记住贴边前位置。
             "snap_left" | "snap_right" => {
                 let mut wa: RECT = std::mem::zeroed();
                 if SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut RECT as *mut c_void, 0)
@@ -215,7 +215,56 @@ fn window_op(op: &str) -> Result<String, String> {
                 let w = (wa.right - wa.left) / 2;
                 let h = wa.bottom - wa.top;
                 let x = if op == "snap_left" { wa.left } else { wa.left + w };
-                SetWindowPos(hwnd, HWND_TOP, x, wa.top, w, h, 0);
+
+                let mut rc: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut rc);
+                let snapped = IsZoomed(hwnd) != 0
+                    || ((rc.left - x).abs() <= 12
+                        && (rc.top - wa.top).abs() <= 12
+                        && (rc.right - (x + w)).abs() <= 12
+                        && (rc.bottom - (wa.top + h)).abs() <= 12);
+                if snapped {
+                    if let Some(r) = pre_snap_take(hwnd as isize) {
+                        SetWindowPos(hwnd, HWND_TOP, r[0], r[1], r[2], r[3], 0);
+                    } else {
+                        // 无记忆（如程序重启后）：退回系统记录的"正常位置"
+                        let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                        wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                        if GetWindowPlacement(hwnd, &mut wp) != 0 {
+                            let n = wp.rcNormalPosition;
+                            SetWindowPos(
+                                hwnd,
+                                HWND_TOP,
+                                n.left,
+                                n.top,
+                                n.right - n.left,
+                                n.bottom - n.top,
+                                0,
+                            );
+                        }
+                    }
+                } else {
+                    let (sl, st, sw, sh);
+                    if IsZoomed(hwnd) != 0 {
+                        // 最大化状态直接贴边会以最大化矩形为基准，先取正常位置
+                        let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                        wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                        GetWindowPlacement(hwnd, &mut wp);
+                        let n = wp.rcNormalPosition;
+                        sl = n.left;
+                        st = n.top;
+                        sw = n.right - n.left;
+                        sh = n.bottom - n.top;
+                        ShowWindow(hwnd, SW_RESTORE);
+                    } else {
+                        sl = rc.left;
+                        st = rc.top;
+                        sw = rc.right - rc.left;
+                        sh = rc.bottom - rc.top;
+                    }
+                    pre_snap_store(hwnd as isize, [sl, st, sw, sh]);
+                    SetWindowPos(hwnd, HWND_TOP, x, wa.top, w, h, 0);
+                }
             }
             other => return Err(format!("未知窗口操作: {other}")),
         };
@@ -226,6 +275,29 @@ fn window_op(op: &str) -> Result<String, String> {
         let _ = op;
         Err("仅支持 Windows".into())
     }
+}
+
+/// 贴边前位置记忆：hwnd → [left, top, width, height]。
+/// 同一手势二次触发时把窗口还原到这里；窗口销毁后的残留条目靠容量上限清理。
+#[cfg(windows)]
+fn pre_snap_map() -> &'static std::sync::Mutex<std::collections::HashMap<isize, [i32; 4]>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<isize, [i32; 4]>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(windows)]
+fn pre_snap_store(k: isize, v: [i32; 4]) {
+    let mut m = pre_snap_map().lock().unwrap();
+    if m.len() > 64 {
+        m.clear();
+    }
+    m.insert(k, v);
+}
+
+#[cfg(windows)]
+fn pre_snap_take(k: isize) -> Option<[i32; 4]> {
+    pre_snap_map().lock().unwrap().remove(&k)
 }
 
 /// 在当前光标位置注入一次中键单击（浏览器：打开悬停链接到新标签页）
@@ -450,119 +522,6 @@ fn lock_workstation() -> Result<String, String> {
 #[cfg(not(windows))]
 fn lock_workstation() -> Result<String, String> {
     Err("仅支持 Windows".into())
-}
-
-/// 常用程序清单（进程关键字, 显示名），供"添加程序"复选列表打底
-pub fn common_programs() -> Vec<(String, String)> {
-    vec![
-        ("msedge".into(), "Microsoft Edge".into()),
-        ("chrome".into(), "Google Chrome".into()),
-        ("firefox".into(), "Firefox".into()),
-        ("explorer".into(), "资源管理器".into()),
-        ("notepad".into(), "记事本".into()),
-        ("weixin".into(), "微信".into()),
-        ("qq".into(), "QQ".into()),
-        ("code".into(), "VS Code".into()),
-        ("cmd".into(), "命令提示符".into()),
-        ("powershell".into(), "PowerShell".into()),
-        ("potplayer".into(), "PotPlayer".into()),
-        ("everything".into(), "Everything".into()),
-        ("winword".into(), "Word".into()),
-        ("excel".into(), "Excel".into()),
-        ("powerpnt".into(), "PowerPoint".into()),
-    ]
-}
-
-/// 当前运行中、带可见窗口的程序进程名（小写无 .exe），按窗口数排序去重
-pub fn running_window_processes() -> Vec<String> {
-    #[cfg(windows)]
-    unsafe {
-        use std::collections::BTreeMap;
-        use winapi::um::handleapi::CloseHandle;
-        use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winbase::QueryFullProcessImageNameW;
-        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
-        use winapi::um::winuser::{
-            EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-        };
-
-        // (pid, 窗口标题非空?) 列表 → 收集后再查进程名（回调里不方便携带复杂状态）
-        let mut windows: Vec<(u32, bool)> = Vec::new();
-        unsafe extern "system" fn cb(hwnd: *mut winapi::shared::windef::HWND__, lparam: isize) -> i32 {
-            let out = &mut *(lparam as *mut Vec<(u32, bool)>);
-            if IsWindowVisible(hwnd) != 0 {
-                let mut pid = 0u32;
-                GetWindowThreadProcessId(hwnd, &mut pid);
-                if pid != 0 {
-                    let mut title = [0u16; 64];
-                    let n = GetWindowTextW(hwnd, title.as_mut_ptr(), 64);
-                    out.push((pid, n > 0));
-                }
-            }
-            1
-        }
-        EnumWindows(Some(cb), &mut windows as *mut _ as isize);
-
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for (pid, has_title) in &windows {
-            let name = (|| {
-                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, *pid);
-                if h.is_null() {
-                    return None;
-                }
-                let mut buf = [0u16; 512];
-                let mut len = buf.len() as u32;
-                let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
-                CloseHandle(h);
-                if ok == 0 {
-                    return None;
-                }
-                let full = String::from_utf16_lossy(&buf[..len as usize]);
-                full.rsplit(['\\', '/'])
-                    .next()
-                    .map(|s| s.trim_end_matches(".exe").trim_end_matches(".EXE").to_ascii_lowercase())
-            })();
-            if let Some(n) = name {
-                // 有标题的主窗口权重更高
-                let e = counts.entry(n).or_default();
-                *e += if *has_title { 2 } else { 1 };
-            }
-        }
-        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        out.into_iter().map(|(n, _)| n).collect()
-    }
-    #[cfg(not(windows))]
-    {
-        Vec::new()
-    }
-}
-
-/// 添加程序候选：运行中进程（按窗口数排序）在前，常用清单打底，按进程名去重
-pub fn candidate_programs() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    for p in running_window_processes() {
-        let display = common_programs()
-            .iter()
-            .find(|(k, _)| *k == p)
-            .map(|(_, d)| d.clone())
-            .unwrap_or_else(|| {
-                let mut c = p.chars();
-                match c.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                    None => p.clone(),
-                }
-            });
-        seen.push(p.clone());
-        out.push((p, display));
-    }
-    for (k, d) in common_programs() {
-        if !seen.contains(&k) {
-            out.push((k, d));
-        }
-    }
-    out
 }
 
 fn vk_for_char(c: char) -> Option<u16> {

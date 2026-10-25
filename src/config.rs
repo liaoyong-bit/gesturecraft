@@ -99,12 +99,12 @@ impl ActionDef {
 pub fn window_op_label(op: &str) -> &str {
     match op {
         "minimize" => "最小化",
-        "maximize" => "最大化",
-        "restore" => "还原",
+        "maximize" => "最大化/还原",
+        "restore" => "还原窗口",
         "close" => "关闭",
         "topmost" => "置顶切换",
-        "snap_left" => "左贴边",
-        "snap_right" => "右贴边",
+        "snap_left" => "左贴边/还原",
+        "snap_right" => "右贴边/还原",
         other => other,
     }
 }
@@ -144,17 +144,9 @@ pub struct GestureDef {
     /// 分类标签（徽章配色用）
     #[serde(default)]
     pub category: String,
-    /// 作用域：进程名关键字（如 msedge、notepad），空=全局。
-    /// 命中时优先于全局手势；画在桌面/公共区域时直接用全局。
-    #[serde(default)]
-    pub scope: String,
 }
 
 impl GestureDef {
-    pub fn is_global(&self) -> bool {
-        self.scope.trim().is_empty()
-    }
-
     pub fn level(&self) -> &'static str {
         level_of(&self.pattern)
     }
@@ -171,14 +163,11 @@ pub struct Config {
     /// 模糊匹配容差：允许与录入序列的最大编辑距离（0=精确）
     #[serde(default = "default_fuzzy")]
     pub fuzzy_tolerance: u32,
-    /// 已添加的程序作用域（进程名关键字列表）
-    #[serde(default = "default_programs")]
-    pub programs: Vec<String>,
     /// 捕捉目标：活动窗口 / 鼠标所指窗口
     #[serde(default)]
     pub target_mode: TargetMode,
     pub gestures: Vec<GestureDef>,
-    /// 配置结构版本；<5 时用新默认表整体替换（v0.4 → v0.5 默认表大改）
+    /// 配置结构版本；<6 时手势表整体换代（v0.5.3 起取消程序作用域，全部全局）
     #[serde(default)]
     pub schema: u32,
 }
@@ -189,9 +178,6 @@ fn default_fuzzy() -> u32 {
 fn default_turn() -> f32 {
     20.0
 }
-fn default_programs() -> Vec<String> {
-    vec!["msedge".into()]
-}
 
 impl Default for Config {
     fn default() -> Self {
@@ -200,10 +186,9 @@ impl Default for Config {
             threshold_px: 30.0,
             turn_px: default_turn(),
             fuzzy_tolerance: default_fuzzy(),
-            programs: default_programs(),
             target_mode: TargetMode::Focused,
             gestures: default_gestures(),
-            schema: 5,
+            schema: 6,
         }
     }
 }
@@ -215,21 +200,7 @@ fn g(category: &str, name: &str, pattern: &str, enabled: bool, action: ActionDef
         enabled,
         action,
         category: category.into(),
-        scope: String::new(),
     }
-}
-
-fn gs(
-    category: &str,
-    name: &str,
-    pattern: &str,
-    enabled: bool,
-    scope: &str,
-    action: ActionDef,
-) -> GestureDef {
-    let mut gd = g(category, name, pattern, enabled, action);
-    gd.scope = scope.into();
-    gd
 }
 
 /// v0.5 默认手势表（用户已确认的分配方案）。
@@ -242,9 +213,9 @@ pub fn default_gestures() -> Vec<GestureDef> {
     // ---------- 一级：8 个单方向，最常用 ----------
     v.push(g("编辑", "复制", "8", true, Hotkey { combo: "ctrl+c".into() }));
     v.push(g("编辑", "粘贴", "2", true, Hotkey { combo: "ctrl+v".into() }));
-    v.push(g("窗口", "窗口左贴边", "4", true, Window { op: "snap_left".into() }));
-    v.push(g("窗口", "窗口右贴边", "6", true, Window { op: "snap_right".into() }));
-    v.push(g("窗口", "最大化", "9", true, Window { op: "maximize".into() }));
+    v.push(g("窗口", "窗口左贴边/还原", "4", true, Window { op: "snap_left".into() }));
+    v.push(g("窗口", "窗口右贴边/还原", "6", true, Window { op: "snap_right".into() }));
+    v.push(g("窗口", "最大化/还原", "9", true, Window { op: "maximize".into() }));
     v.push(g("窗口", "最小化", "1", true, Window { op: "minimize".into() }));
     v.push(g("编辑", "撤销", "7", true, Hotkey { combo: "ctrl+z".into() }));
     v.push(g("编辑", "重做", "3", true, Hotkey { combo: "ctrl+y".into() }));
@@ -300,65 +271,7 @@ pub fn default_gestures() -> Vec<GestureDef> {
         v.push(g("其他", &format!("三级备选 {pat}"), pat, false, Hotkey { combo: String::new() }));
     }
 
-    // ---------- Edge 程序作用域：官方 16 手势完整复刻，默认启用 ----------
-    let edge = [
-        ("后退", "4", Browser { op: "back".into() }),
-        ("前进", "6", Browser { op: "forward".into() }),
-        ("滚动到页面顶部", "8", Hotkey { combo: "ctrl+home".into() }),
-        ("滚动到页面底部", "2", Hotkey { combo: "ctrl+end".into() }),
-        ("关闭当前标签页", "23", Hotkey { combo: "ctrl+w".into() }),
-        ("恢复已关闭标签页", "21", Hotkey { combo: "ctrl+shift+t".into() }),
-        ("切换到右侧标签页", "89", Hotkey { combo: "ctrl+tab".into() }),
-        ("切换到左侧标签页", "87", Hotkey { combo: "ctrl+shift+tab".into() }),
-        ("链接在新标签页打开", "69", Browser { op: "open_link_new_tab".into() }),
-        ("链接在新窗口打开", "63", Browser { op: "open_link_new_window".into() }),
-        ("刷新页面", "47", Browser { op: "refresh".into() }),
-        ("停止加载页面", "41", Browser { op: "stop".into() }),
-        ("新建标签页", "28", Hotkey { combo: "ctrl+t".into() }),
-        ("复制当前标签页", "82", Hotkey { combo: "ctrl+shift+k".into() }),
-        ("关闭右侧所有标签页", "64", Browser { op: "close_tabs_right".into() }),
-        ("关闭其他标签页", "46", Browser { op: "close_other_tabs".into() }),
-    ];
-    for (name, pat, act) in edge {
-        v.push(gs("浏览器", &format!("Edge·{name}"), pat, true, "msedge", act));
-    }
-
     v
-}
-
-/// Office 程序专属预置（按编辑快捷键使用频率排序）。
-/// 作用域内手势与全局重复属正常覆盖，不冲突。
-/// app: "winword" | "excel" | "powerpnt"
-pub fn office_presets(app: &str) -> Vec<GestureDef> {
-    use ActionDef::*;
-    let (label, scope) = match app {
-        "winword" => ("Word", "winword"),
-        "excel" => ("Excel", "excel"),
-        "powerpnt" => ("PPT", "powerpnt"),
-        _ => return Vec::new(),
-    };
-    let mut items: Vec<(&str, &str, ActionDef)> = vec![
-        ("撤销", "7", Hotkey { combo: "ctrl+z".into() }),
-        ("重做", "3", Hotkey { combo: "ctrl+y".into() }),
-        ("保存", "82", Hotkey { combo: "ctrl+s".into() }),
-        ("加粗", "8", Hotkey { combo: "ctrl+b".into() }),
-        ("斜体", "2", Hotkey { combo: "ctrl+i".into() }),
-        ("下划线", "62", Hotkey { combo: "ctrl+u".into() }),
-        ("居中", "23", Hotkey { combo: "ctrl+e".into() }),
-        ("左对齐", "21", Hotkey { combo: "ctrl+l".into() }),
-        ("右对齐", "29", Hotkey { combo: "ctrl+r".into() }),
-        ("查找", "87", Hotkey { combo: "ctrl+f".into() }),
-        ("替换", "89", Hotkey { combo: "ctrl+h".into() }),
-        ("打印", "43", Hotkey { combo: "ctrl+p".into() }),
-    ];
-    if app == "powerpnt" {
-        items.push(("幻灯片放映", "842", Hotkey { combo: "f5".into() }));
-        items.push(("从头放映（当前页）", "846", Hotkey { combo: "shift+f5".into() }));
-    }
-    items
-        .into_iter()
-        .map(|(name, pat, act)| gs("编辑", &format!("{label}·{name}"), pat, true, scope, act))
-        .collect()
 }
 
 /// 旧版 UDLR 序列 → 8 方向数字编码，并折叠相邻重复（旧版 "DD" 不可达，归一为 "2"）。
@@ -386,61 +299,24 @@ fn migrate_pattern(p: &str) -> String {
 }
 
 impl Config {
-    /// 保存前的重复检测——查的就是 config.json 这份"小库"，实时反映当前全部手势。
-    /// 允许重复，只产生提示文案；exclude = 编辑已有手势时跳过它自己。
-    pub fn conflict_warnings(&self, cand: &GestureDef, exclude: Option<usize>) -> Vec<String> {
+    /// 保存前冲突检查——重复即报错、不允许保存（全部全局，不存在作用域覆盖）。
+    /// 只与"已启用"的手势比（备选/停用不算占用）；exclude = 编辑已有手势时跳过它自己。
+    /// 返回错误文案列表；非空则调用方必须阻止保存。
+    pub fn blocking_conflicts(&self, cand: &GestureDef, exclude: Option<usize>) -> Vec<String> {
         let mut out = Vec::new();
-        if cand.pattern.is_empty() {
-            return out;
-        }
-        let cand_scopes: Vec<String> = cand
-            .scope
-            .to_ascii_lowercase()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
         for (i, g) in self.gestures.iter().enumerate() {
-            if Some(i) == exclude || !g.enabled || g.pattern.is_empty() {
+            if Some(i) == exclude || !g.enabled {
                 continue;
             }
-            // 作用域是否重叠：任一方为全局即覆盖面重叠；否则看进程关键字交集
-            let other_scopes: Vec<String> = g
-                .scope
-                .to_ascii_lowercase()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            // 程序手势覆盖全局是设计行为（程序内只执行程序设定），
-            // 一全局一程序不算冲突；只有 全局↔全局 或 程序↔同程序 才提示
-            let overlap = if cand_scopes.is_empty() {
-                other_scopes.is_empty()
-            } else if other_scopes.is_empty() {
-                false
-            } else {
-                cand_scopes.iter().any(|a| other_scopes.contains(a))
-            };
-            if !overlap {
-                continue;
-            }
-            if g.pattern == cand.pattern {
-                let scope_desc = if other_scopes.is_empty() { "全局" } else { "程序作用域" };
+            if !cand.pattern.is_empty() && g.pattern == cand.pattern {
                 out.push(format!(
-                    "方向序列 {} 已被「{}」（{scope_desc}）占用",
+                    "方向序列 {} 已被「{}」占用，请换一个手势或先停用/删除它",
                     crate::gesture::arrows(&cand.pattern),
                     g.name
                 ));
             }
-            if g.action == cand.action {
-                out.push(format!(
-                    "动作「{}」与「{}」重复绑定",
-                    cand.action.summary(),
-                    g.name
-                ));
-            }
-            if g.name.trim() == cand.name.trim() {
-                out.push(format!("名称「{}」已存在", cand.name.trim()));
+            if !cand.name.trim().is_empty() && g.name.trim() == cand.name.trim() {
+                out.push(format!("名称「{}」已存在，请改名", cand.name.trim()));
             }
         }
         out.dedup();
@@ -460,13 +336,21 @@ impl Config {
                     for gd in &mut c.gestures {
                         gd.pattern = migrate_pattern(&gd.pattern);
                     }
-                    // v0.4 及更早配置（schema<5）：默认表整体换代，保留触发设置
-                    if c.schema < 5 {
-                        let (trigger, th, fuzzy) = (c.trigger, c.threshold_px, c.fuzzy_tolerance);
+                    // 旧配置（schema<6，含程序作用域/程序预设）：手势表整体换代，保留触发设置
+                    if c.schema < 6 {
+                        let (trigger, th, turn, fuzzy, tm) = (
+                            c.trigger,
+                            c.threshold_px,
+                            c.turn_px,
+                            c.fuzzy_tolerance,
+                            c.target_mode,
+                        );
                         c = Config {
                             trigger,
                             threshold_px: th,
+                            turn_px: turn,
                             fuzzy_tolerance: fuzzy,
+                            target_mode: tm,
                             ..Config::default()
                         };
                         let _ = c.save();
