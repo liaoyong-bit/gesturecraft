@@ -1,16 +1,20 @@
 //! Windows 低级鼠标钩子线程。
-//! 钩子回调内维护录制状态：触发键按下 → 位移超过阈值进入手势模式（吞掉事件防止
-//! 弹出上下文菜单）→ 松开时把整条轨迹交给引擎线程执行匹配。
+//! 触发键按下 → 位移超过阈值进入手势模式（光标照常移动，仅松开时吞掉 UP
+//! 防止弹出上下文菜单）→ 完整轨迹交给引擎线程匹配，并请求 UI 重绘显示日志。
+//! 钩子回调内绝不等待长锁：threshold 在触发键按下时一次性缓存到原子变量，
+//! 移动事件路径上只碰无争用的 Mutex/Atomic，避免 Windows 因回调超时移除钩子。
 
 use crate::config::MouseButton;
 use crate::engine::{self, Ctx};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 struct HookState {
     start: Mutex<Option<(i32, i32)>>,
     points: Mutex<Vec<(i32, i32)>>,
     gesturing: AtomicBool,
+    /// 触发键按下时缓存的起手势阈值（像素），移动热路径不再读 config
+    threshold: AtomicU32,
 }
 
 static STATE: OnceLock<HookState> = OnceLock::new();
@@ -33,6 +37,7 @@ unsafe fn run_hook(ctx: Ctx) {
         start: Mutex::new(None),
         points: Mutex::new(Vec::new()),
         gesturing: AtomicBool::new(false),
+        threshold: AtomicU32::new(30),
     });
     let _ = CTX.set(ctx);
 
@@ -54,74 +59,65 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
         WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
-    let ret_pass = |code: i32, wparam: usize, lparam: isize| {
-        CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
-    };
-
     if code < 0 {
-        return ret_pass(code, wparam, lparam);
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
     let (Some(state), Some(ctx)) = (STATE.get(), CTX.get()) else {
-        return ret_pass(code, wparam, lparam);
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     };
 
     let info = &*(lparam as *const MSLLHOOKSTRUCT);
     let msg = wparam as u32;
     let (x, y) = (info.pt.x, info.pt.y);
 
-    // 触发键与配置是否一致
-    let trigger_matches = |down_msg: u32| -> bool {
-        let want = ctx.config.read().unwrap().trigger;
-        match want {
-            MouseButton::Right => down_msg == WM_RBUTTONDOWN,
-            MouseButton::Middle => down_msg == WM_MBUTTONDOWN,
-        }
-    };
-
     match msg {
         m if m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN => {
-            if trigger_matches(m) {
+            // 只有配置的触发键才进入录制；threshold 此时读一次 config
+            let want = ctx.config.read().unwrap().trigger;
+            let matched = match want {
+                MouseButton::Right => m == WM_RBUTTONDOWN,
+                MouseButton::Middle => m == WM_MBUTTONDOWN,
+            };
+            if matched {
+                let th = ctx.config.read().unwrap().threshold_px;
+                state.threshold.store(th as u32, Ordering::Relaxed);
                 *state.start.lock().unwrap() = Some((x, y));
                 state.points.lock().unwrap().clear();
-                state.gesturing.store(false, Ordering::SeqCst);
+                state.gesturing.store(false, Ordering::Relaxed);
             }
         }
         WM_MOUSEMOVE => {
-            if state.gesturing.load(Ordering::SeqCst) {
+            if state.gesturing.load(Ordering::Relaxed) {
                 state.points.lock().unwrap().push((x, y));
-                return 1; // 手势中吞掉移动事件
-            }
-            if let Some((sx, sy)) = *state.start.lock().unwrap() {
-                let threshold = ctx.config.read().unwrap().threshold_px as f32;
+                // 放行移动事件：光标照常跟随，不再冻结
+            } else if let Some((sx, sy)) = *state.start.lock().unwrap() {
+                let threshold = f32::from_bits(state.threshold.load(Ordering::Relaxed));
                 let d = ((x - sx) as f32).hypot((y - sy) as f32);
                 if d >= threshold {
-                    state.gesturing.store(true, Ordering::SeqCst);
+                    state.gesturing.store(true, Ordering::Relaxed);
                     let mut pts = state.points.lock().unwrap();
                     pts.push((sx, sy));
                     pts.push((x, y));
                 }
             }
         }
-        m if m == WM_RBUTTONUP || m == WM_MBUTTONUP => {
-            let was_gesturing = state.gesturing.swap(false, Ordering::SeqCst);
+        m if m == WM_RBUTTONUP || WM_MBUTTONUP == m => {
+            let was_gesturing = state.gesturing.swap(false, Ordering::Relaxed);
             let had_start = state.start.lock().unwrap().take().is_some();
             if was_gesturing {
                 let pts = state.points.lock().unwrap().clone();
                 std::thread::spawn(move || {
-                    // 从静态 CTX 取引用，避免跨线程传递裸指针
                     if let Some(c) = CTX.get() {
                         engine::handle_path(c, pts);
                     }
                 });
                 return 1; // 吞掉抬起，防止弹菜单
             }
-            if !had_start {
-                // 与触发无关的按键，正常放行
-            }
+            let _ = had_start;
         }
         _ => {}
     }
 
-    ret_pass(code, wparam, lparam)
+    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
 }

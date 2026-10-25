@@ -1,4 +1,5 @@
 use crate::config::{ActionDef, Config, GestureDef, MouseButton};
+use crate::engine;
 use crate::gesture;
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,7 @@ pub fn run_ui(
     config: Arc<RwLock<Config>>,
     logs: Arc<Mutex<Vec<String>>>,
     paused: Arc<AtomicBool>,
+    ui_ctx: Arc<std::sync::OnceLock<egui::Context>>,
 ) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -38,6 +40,7 @@ pub fn run_ui(
         "GestureCraft",
         options,
         Box::new(move |cc| {
+            engine::Ctx::set_ui_ctx_once(&ui_ctx, cc.egui_ctx.clone());
             cc.egui_ctx.set_visuals(egui::Visuals::light());
             load_cjk_font(&cc.egui_ctx);
             let draft = default_draft();
@@ -121,16 +124,20 @@ impl eframe::App for UiApp {
             Tab::About => self.show_about(ui),
         });
 
-        // 底部日志条
+        // 底部日志条：显示最近 6 条，引擎命中手势会请求重绘即时刷新
         egui::TopBottomPanel::bottom("log").show(ctx, |ui| {
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.strong("日志");
-                let logs = self.logs.lock().unwrap();
-                if let Some(last) = logs.last() {
-                    ui.label(egui::WidgetText::from(last.as_str()).small());
-                }
-            });
+            ui.strong("日志");
+            let logs = self.logs.lock().unwrap();
+            egui::ScrollArea::vertical()
+                .max_height(96.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    let start = logs.len().saturating_sub(6);
+                    for line in &logs[start..] {
+                        ui.label(egui::WidgetText::from(line.as_str()).small());
+                    }
+                });
         });
     }
 }

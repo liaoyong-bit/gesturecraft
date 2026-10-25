@@ -17,13 +17,15 @@ fn main() {
     let config = Arc::new(RwLock::new(config::Config::load_or_default()));
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let paused = Arc::new(AtomicBool::new(false));
+    let ui_ctx: Arc<std::sync::OnceLock<eframe::egui::Context>> = Arc::new(Default::default());
 
     #[cfg(windows)]
     hook::start_hook_thread(engine::Ctx {
         config: config.clone(),
         logs: logs.clone(),
         paused: paused.clone(),
+        ui_ctx: ui_ctx.clone(),
     });
 
-    app::run_ui(config, logs, paused);
+    app::run_ui(config, logs, paused, ui_ctx);
 }
